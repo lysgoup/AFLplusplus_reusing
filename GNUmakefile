@@ -701,6 +701,7 @@ clean:
 	rm -rf $(PROGS) afl-fuzz-document as afl-as afl-g++ afl-clang afl-clang++ *.o src/*.o *~ a.out core core.[1-9][0-9]* *.stackdump .test .test1 .test2 test-instr .test-instr0 .test-instr1 afl-cs-proxy afl-qemu-trace afl-qemu-bridge afl-gcc-fast afl-g++-fast ld *.so *.8 test/unittests/*.o test/unittests/unit_maybe_alloc test/unittests/preallocable .afl-* afl-gcc afl-g++ afl-clang afl-clang++ test/unittests/unit_hash test/unittests/unit_rand *.dSYM lib*.a
 	-$(MAKE) -f GNUmakefile.llvm clean
 	-$(MAKE) -f GNUmakefile.gcc_plugin clean
+	-$(MAKE) -C dtaint_runtime clean
 	-$(MAKE) -C utils/libdislocator clean
 	-$(MAKE) -C utils/libtokencap clean
 	-$(MAKE) -C utils/aflpp_driver clean
@@ -748,6 +749,7 @@ endif
 .PHONY: distrib
 distrib: all
 	-$(MAKE) -j$(nproc) -f GNUmakefile.llvm
+	-$(MAKE) -C dtaint_runtime
 ifneq "$(SYS)" "Darwin"
 	-$(MAKE) -f GNUmakefile.gcc_plugin
 	-$(MAKE) -C utils/libdislocator
@@ -837,6 +839,7 @@ endif
 .PHONY: source-only
 source-only: all
 	-$(MAKE) -j$(nproc) -f GNUmakefile.llvm
+	-$(MAKE) -C dtaint_runtime
 ifneq "$(SYS)" "Darwin"
 	-$(MAKE) -f GNUmakefile.gcc_plugin
 	-$(MAKE) -C utils/libdislocator
@@ -894,6 +897,7 @@ install: all $(MANPAGES)
 	@if [ -f afl-qemu-trace ]; then install -m 755 afl-qemu-trace $${DESTDIR}$(BIN_PATH); fi
 	@if [ -f afl-qemu-bridge ]; then install -m 755 afl-qemu-bridge $${DESTDIR}$(BIN_PATH); fi
 	@if [ -f utils/plot_ui/afl-plot-ui ]; then install -m 755 utils/plot_ui/afl-plot-ui $${DESTDIR}$(BIN_PATH); fi
+	@if [ -f libdtaint-rt.a ]; then set -e; install -m 644 libdtaint-rt.a $${DESTDIR}$(HELPER_PATH); fi
 	@if [ -f libdislocator.so ]; then set -e; install -m 755 libdislocator.so $${DESTDIR}$(HELPER_PATH); fi
 	@if [ -f libtokencap.so ]; then set -e; install -m 755 libtokencap.so $${DESTDIR}$(HELPER_PATH); fi
 	@if [ -f libcompcov.so ]; then set -e; install -m 755 libcompcov.so $${DESTDIR}$(HELPER_PATH); fi
@@ -927,7 +931,7 @@ endif
 uninstall:
 	-cd $${DESTDIR}$(BIN_PATH) && rm -f $(PROGS) $(SH_PROGS) afl-cs-proxy afl-qemu-trace afl-qemu-bridge afl-plot-ui afl-fuzz-document afl-network-client afl-network-server afl-g* afl-plot.sh afl-ld-lto afl-c* afl-lto*
 	-cd $${DESTDIR}$(INCLUDE_PATH) && rm -f $(HEADERS:include/%=%)
-	-cd $${DESTDIR}$(HELPER_PATH) && rm -f afl-g*.*o afl-llvm-*.*o afl-compiler-*.*o libdislocator.so libtokencap.so libcompcov.so libqasan.so afl-frida-trace.so libnyx.so socketfuzz*.so argvfuzz*.so libAFLDriver.a libAFLQemuDriver.a as afl-as SanitizerCoverage*.so compare-transform-pass.so cmplog-*-pass.so split-*-pass.so dynamic_list.txt injections.dic
+	-cd $${DESTDIR}$(HELPER_PATH) && rm -f afl-g*.*o afl-llvm-*.*o afl-compiler-*.*o libdislocator.so libtokencap.so libcompcov.so libqasan.so afl-frida-trace.so libnyx.so socketfuzz*.so argvfuzz*.so libAFLDriver.a libAFLQemuDriver.a libdtaint-rt.a as afl-as SanitizerCoverage*.so compare-transform-pass.so cmplog-*-pass.so split-*-pass.so dynamic_list.txt injections.dic
 	-rm -rf $${DESTDIR}$(MISC_PATH)/testcases $${DESTDIR}$(MISC_PATH)/dictionaries
 	-sh -c "ls docs/*.md | sed 's|^docs/|$${DESTDIR}$(DOC_PATH)/|' | xargs rm -f"
 	-cd $${DESTDIR}$(MAN_PATH) && rm -f $(MANPAGES)

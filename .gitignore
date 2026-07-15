@@ -86,6 +86,9 @@ in
 ld
 libAFLDriver.a
 libAFLQemuDriver.a
+libdtaint-rt.a
+dtaint_runtime/*.o
+dtaint_runtime/*.a
 out
 qemu_mode/libcompcov/compcovtest
 qemu_mode/qemu-*

@@ -841,6 +841,13 @@ typedef struct afl_state {
   char            *cmplog_binary;
   afl_forkserver_t cmplog_fsrv;     /* cmplog has its own little forkserver */
 
+  /* Dynamic taint tracking (minimal validation slice, ported from Angora --
+     see instrumentation/README.dtaint.md). No consumer logic yet -- this
+     forkserver exists so a taint run can be triggered and its track file
+     inspected, nothing reads the result back into mutation strategy yet. */
+  char            *dtaint_binary;
+  afl_forkserver_t dtaint_fsrv;     /* dtaint has its own little forkserver */
+
   /* ASAN Fuzing */
   char            *san_binary[MAX_EXTRA_SAN_BINARY];
   afl_forkserver_t san_fsrvs[MAX_EXTRA_SAN_BINARY];
@@ -1480,6 +1487,11 @@ void maybe_sync_fuzzers(afl_state_t *afl, u64 cur_time, u32 *sync_interval_cnt);
 /* CmpLog */
 
 u8 common_fuzz_cmplog_stuff(afl_state_t *afl, u8 *out_buf, u32 len);
+
+/* Dynamic taint tracking (minimal validation slice) */
+
+u8 run_one_dtaint(afl_state_t *afl, u8 *out_buf, u32 len,
+                   const u8 *track_file_path);
 
 /* RedQueen */
 u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len);

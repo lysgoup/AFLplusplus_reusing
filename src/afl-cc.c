@@ -175,7 +175,7 @@ typedef struct aflcc_state {
 
   u8 instrument_mode, instrument_opt_mode;
 
-  u8 cmplog_mode, c11_mode;
+  u8 cmplog_mode, c11_mode, dtaint_mode;
 
   u8 have_instr_env, have_gcc, have_clang, have_llvm, have_gcc_plugin, have_lto,
       have_optimized_pcguard, have_instr_list, wnoerror,
@@ -1312,6 +1312,8 @@ void mode_final_checkout(aflcc_state_t *aflcc) {
                        getenv("AFL_GCC_CMPLOG");
 
   aflcc->c11_mode = getenv("AFL_LLVM_C11") != NULL;
+
+  aflcc->dtaint_mode = getenv("AFL_LLVM_DTAINT") != NULL;
 
 }
 
@@ -2497,6 +2499,12 @@ void add_runtime(aflcc_state_t *aflcc) {
 
 #endif
 
+  if (aflcc->dtaint_mode && !aflcc->shared_linking && !aflcc->partial_linking) {
+
+    insert_object(aflcc, "libdtaint-rt.a", 0, 0);
+
+  }
+
   add_aflpplib(aflcc);  // double insertion helps compiling
 
 #if defined(USEMMAP) && !defined(__HAIKU__) && !__APPLE__
@@ -3619,6 +3627,14 @@ static void edit_params(aflcc_state_t *aflcc, u32 argc, char **argv,
 
     if (aflcc->c11_mode) { load_llvm_pass(aflcc, "afl-c11-pass.so"); }
 
+    // Dynamic taint tracking (minimal validation slice, ported from Angora)
+
+    if (aflcc->dtaint_mode) {
+
+      load_llvm_pass(aflcc, "afl-llvm-dtaint-pass.so");
+
+    }
+
     // laf
     if (getenv("LAF_SPLIT_SWITCHES") || getenv("AFL_LLVM_LAF_SPLIT_SWITCHES")) {
 
@@ -3873,6 +3889,13 @@ int main(int argc, char **argv, char **envp) {
 
       WARNF("CMPLOG support requires LLVM 14+");
       aflcc->cmplog_mode = 0;
+
+    }
+
+    if (aflcc->dtaint_mode) {
+
+      WARNF("DTAINT support requires LLVM 14+");
+      aflcc->dtaint_mode = 0;
 
     }
 

@@ -30,6 +30,7 @@
 #include "afl-ijon-min.h"
 #include "alloc-inl.h"
 #include "cmplog.h"
+#include "dtaint.h"
 #include <sys/stat.h>
 #include <errno.h>
 #include "asanfuzz.h"
@@ -2951,6 +2952,39 @@ void afl_alloc_shared_memory(afl_state_t *afl) {
 
   }
 
+  /* Populated from an env var, not a CLI flag: this slice's whole point is
+     a scripted one-shot verification run, not interactive fuzzing UI, so
+     there's no need for getopt optstring surgery here yet. */
+  if (!afl->dtaint_binary) { afl->dtaint_binary = getenv("AFL_DTAINT_BINARY"); }
+
+  if (afl->dtaint_binary) {
+
+    ACTF("Spawning dtaint forkserver");
+    afl_fsrv_init_dup(&afl->dtaint_fsrv, &afl->fsrv);
+    afl->dtaint_fsrv.trace_bits = afl->fsrv.trace_bits;
+    afl->dtaint_fsrv.child_sync_offset = afl->fsrv.child_sync_offset;
+    afl->dtaint_fsrv.cs_mode = afl->fsrv.cs_mode;
+    afl->dtaint_fsrv.qemu_mode = afl->fsrv.qemu_mode;
+    afl->dtaint_fsrv.qemu_bridge = afl->fsrv.qemu_bridge;
+    afl->dtaint_fsrv.unicorn_mode = afl->fsrv.unicorn_mode;
+    afl->dtaint_fsrv.frida_mode = afl->fsrv.frida_mode;
+    /* Unlike cmplog, target_path is the dtaint binary itself directly --
+       there is no argv[0]-rewrite trick needed since this forkserver never
+       runs the main coverage binary at all (see dtaint_exec_child,
+       src/afl-fuzz-dtaint.c). No map-size renegotiation either: this is a
+       minimal validation slice with no consumer reading afl->dtaint_fsrv's
+       coverage map, so whatever size afl_fsrv_init_dup already cloned from
+       &afl->fsrv is fine. */
+    afl->dtaint_fsrv.target_path = afl->dtaint_binary;
+    afl->dtaint_fsrv.init_child_func = dtaint_exec_child;
+
+    afl_fsrv_start(&afl->dtaint_fsrv, afl->argv, &afl->stop_soon,
+                   afl->afl_env.afl_debug_child);
+
+    OKF("Dtaint forkserver successfully started");
+
+  }
+
   load_auto(afl);
 
   if (afl->extras_dir_cnt) {
@@ -3650,6 +3684,8 @@ void stop_fuzzing(afl_state_t *afl) {
   }
 
   if (afl->cmplog_binary) { afl_fsrv_deinit(&afl->cmplog_fsrv); }
+
+  if (afl->dtaint_binary) { afl_fsrv_deinit(&afl->dtaint_fsrv); }
 
   /* remove tmpfile */
   if (!afl->in_place_resume && afl->fsrv.out_file) {
