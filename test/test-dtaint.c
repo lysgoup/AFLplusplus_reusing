@@ -1,15 +1,8 @@
 /*
-   Minimal validation harness for the dynamic taint tracking slice
-   (instrumentation/afl-llvm-dtaint-pass.so.cc + dtaint_runtime/).
+   Validation harness for dynamic taint tracking (Piece 4: Angora-parity
+   taint info -- instrumentation/afl-llvm-dtaint-pass.so.cc + dtaint_runtime/).
 
-   Deliberately not a libFuzzer-style LLVMFuzzerTestOneInput harness (unlike
-   test-cmplog.c): this slice's taint source is an explicit runtime call the
-   harness makes itself (dtaint_source_buf), not something wired into a
-   fuzzer-driven entry point yet, so a plain argv[1]-file harness is clearer
-   for standalone verification.
-
-   Build (once a machine with LLVM 14-21 is available -- untested in the
-   environment this was written in):
+   Build:
 
      AFL_LLVM_DTAINT=1 AFL_DONT_OPTIMIZE=1 \
        ./afl-clang-fast -o test-dtaint test/test-dtaint.c dtaint_runtime/libdtaint-rt.a
@@ -18,20 +11,26 @@
 
      AFL_DTAINT_TRACK_FILE=/tmp/track.bin ./test-dtaint /tmp/in.bin
 
-   The four nested comparisons below exercise all four instrumented
-   instruction categories in afl-llvm-dtaint-pass.so.cc: plain ICmpInst
-   (cmp #1, #2), a multi-byte load combined via BinaryOperator Or/Shl
-   (cmp #3), and an Add BinaryOperator feeding an ICmpInst (cmp #4).
+   Unlike the original minimal-slice harness, this one does *not* call
+   dtaint_source_buf explicitly -- `read()` below gets redirected by the
+   pass to the ABI-list wrapper __dtaint_read (see
+   instrumentation/README.dtaint.md's "ABI list" section), so `buf` is
+   tainted automatically, exactly like a real Angora-instrumented binary
+   reading its input.
+
+   Exercises: plain ICmpInst (cmp #1, #2), a multi-byte load combined via
+   Or/Shl (cmp #3), an Add feeding an ICmpInst (cmp #4), a switch statement
+   (cmp #5, one record per case), and a strcmp call redirected to the cmpfn
+   wrapper __dtaint_strcmp (cmp #6) after a memcpy propagates taint into a
+   local buffer.
 */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
-#include "dtaint.h"
-
-#define INLEN 6
+#define INLEN 11
 
 int main(int argc, char **argv) {
 
@@ -55,9 +54,6 @@ int main(int argc, char **argv) {
 
   }
 
-  /* Explicit taint source seed -- see file header. */
-  dtaint_source_buf(buf, INLEN);
-
   if (buf[0] == 'A') {                            /* cmp #1: offset {0} */
 
     if (buf[1] == 'B') {                          /* cmp #2: offset {1} */
@@ -67,13 +63,31 @@ int main(int argc, char **argv) {
 
         if (buf[4] + buf[5] == 100) {             /* cmp #4: offsets {4,5} */
 
-          printf("all four comparisons matched\n");
+          printf("first four comparisons matched\n");
 
         }
 
       }
 
     }
+
+  }
+
+  switch (buf[6]) {                               /* cmp #5: offset {6} */
+
+    case 1: printf("case1\n"); break;
+    case 2: printf("case2\n"); break;
+    case 3: printf("case3\n"); break;
+    default: printf("default\n"); break;
+
+  }
+
+  char local[8];
+  memset(local, 0, sizeof(local));
+  memcpy(local, buf + 7, 4);                      /* propagate {7,8,9,10} */
+  if (strcmp(local, "TEST") == 0) {               /* cmp #6: cmpfn */
+
+    printf("matched TEST\n");
 
   }
 

@@ -802,6 +802,17 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
 
     add_to_queue(afl, queue_fn, len, 0);
 
+    /* Angora-style: run taint tracking immediately on any genuinely new
+       queue entry (not on every execution), gated on the dtaint forkserver
+       actually having been started (AFL_DTAINT_BINARY). Log-only for now
+       -- see log_dtaint_for_new_input()'s own comment and
+       instrumentation/README.dtaint.md's "Known gaps". */
+    if (unlikely(afl->dtaint_binary)) {
+
+      log_dtaint_for_new_input(afl, mem, len, queue_fn);
+
+    }
+
     if (unlikely(afl->fuzz_mode) &&
         likely(afl->switch_fuzz_mode && !afl->non_instrumented_mode)) {
 

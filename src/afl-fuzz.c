@@ -2959,6 +2959,39 @@ void afl_alloc_shared_memory(afl_state_t *afl) {
 
   if (afl->dtaint_binary) {
 
+    /* Per-input taint-tracking track files land here (one per newly
+       discovered queue entry) -- see save_if_interesting()'s call into
+       log_dtaint_for_new_input() (src/afl-fuzz-bitmap.c). Created *before*
+       afl_fsrv_start() below since AFL_DTAINT_TRACK_FILE (set right after)
+       must point at an existing directory. */
+    u8 *dtaint_log_dir = alloc_printf("%s/dtaint_logs", afl->out_dir);
+    if (mkdir(dtaint_log_dir, afl->dir_perm) && errno != EEXIST) {
+
+      PFATAL("Unable to create '%s'", dtaint_log_dir);
+
+    }
+
+    /* IMPORTANT: the forkserver protocol execve()s the target exactly once
+       here, and every later invocation is a plain fork() of that already-
+       running process (see instrumentation/afl-compiler-rt.o.c's
+       __afl_start_forkserver loop) -- there is no re-exec and no per-
+       execution re-read of the environment. That means AFL_DTAINT_TRACK_FILE
+       can only ever be set *once*, right here, before afl_fsrv_start(); a
+       setenv() call made later from afl-fuzz's own process (a separate
+       process from the target) can never reach already-forked children.
+       Confirmed by testing: an earlier version tried to setenv() a fresh
+       per-input path before every run_one_dtaint() call and silently
+       produced zero track files across an entire fuzzing session. Fixed by
+       fixing the env var to one scratch path for the whole session and
+       having log_dtaint_for_new_input() rename() that file to its real
+       per-input destination after each run instead -- the same "fixed
+       location set once, mutated per-run" pattern afl->fsrv.shmem_fuzz
+       already uses for testcase bytes. */
+    u8 *dtaint_scratch = alloc_printf("%s/%s", dtaint_log_dir, DTAINT_SCRATCH_NAME);
+    setenv(DTAINT_TRACK_ENV_VAR, (char *)dtaint_scratch, 1);
+    ck_free(dtaint_scratch);
+    ck_free(dtaint_log_dir);
+
     ACTF("Spawning dtaint forkserver");
     afl_fsrv_init_dup(&afl->dtaint_fsrv, &afl->fsrv);
     afl->dtaint_fsrv.trace_bits = afl->fsrv.trace_bits;

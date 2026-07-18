@@ -1488,10 +1488,17 @@ void maybe_sync_fuzzers(afl_state_t *afl, u64 cur_time, u32 *sync_interval_cnt);
 
 u8 common_fuzz_cmplog_stuff(afl_state_t *afl, u8 *out_buf, u32 len);
 
-/* Dynamic taint tracking (minimal validation slice) */
+/* Dynamic taint tracking (see instrumentation/README.dtaint.md) */
 
-u8 run_one_dtaint(afl_state_t *afl, u8 *out_buf, u32 len,
-                   const u8 *track_file_path);
+u8 run_one_dtaint(afl_state_t *afl, u8 *out_buf, u32 len);
+
+/* Triggers a taint-tracking run for a newly-discovered queue entry and
+   leaves its track file under <out_dir>/dtaint_logs/ -- called from
+   save_if_interesting() right after add_to_queue(), gated on
+   afl->dtaint_binary (i.e. AFL_DTAINT_BINARY) being set. Nothing reads the
+   resulting file back yet -- see the README's "Known gaps". */
+void log_dtaint_for_new_input(afl_state_t *afl, u8 *mem, u32 len,
+                              u8 *queue_fname);
 
 /* RedQueen */
 u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len);

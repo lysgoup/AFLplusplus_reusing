@@ -21,7 +21,10 @@ VERSION     = $(shell grep '^\#define VERSION ' ../config.h | cut -d '"' -f2)
 CFLAGS      ?= -O0 -g
 override CFLAGS += -I ../include/ -Wall
 
-SRCS = dtaint-rt.c
+SRCS = dtaint-rt.c dtaint_abi.c dtaint_tagset.c dtaint_len_label.c dtaint_logger.c
+OBJS = $(SRCS:.c=.o)
+HDRS = ../include/dtaint.h dtaint_tagset.h dtaint_len_label.h dtaint_logger.h \
+       dtaint_internal.h
 
 all: libdtaint-rt.a
 
@@ -29,10 +32,12 @@ all: libdtaint-rt.a
 # binary at compile time (via afl-cc.c's add_runtime(), the same mechanism
 # afl-compiler-rt.o already uses), not dlopen'd/LD_PRELOADed the way
 # libdislocator.so/libtokencap.so are.
-libdtaint-rt.a: $(SRCS) ../include/dtaint.h ../config.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c dtaint-rt.c -o dtaint-rt.o
-	ar rcs $@ dtaint-rt.o
+libdtaint-rt.a: $(OBJS)
+	ar rcs $@ $(OBJS)
 	cp -fv libdtaint-rt.a ../
+
+%.o: %.c $(HDRS) ../config.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 .NOTPARALLEL: clean
 
