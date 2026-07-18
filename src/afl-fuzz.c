@@ -3004,12 +3004,31 @@ void afl_alloc_shared_memory(afl_state_t *afl) {
     /* Unlike cmplog, target_path is the dtaint binary itself directly --
        there is no argv[0]-rewrite trick needed since this forkserver never
        runs the main coverage binary at all (see dtaint_exec_child,
-       src/afl-fuzz-dtaint.c). No map-size renegotiation either: this is a
-       minimal validation slice with no consumer reading afl->dtaint_fsrv's
-       coverage map, so whatever size afl_fsrv_init_dup already cloned from
-       &afl->fsrv is fine. */
+       src/afl-fuzz-dtaint.c). */
     afl->dtaint_fsrv.target_path = afl->dtaint_binary;
     afl->dtaint_fsrv.init_child_func = dtaint_exec_child;
+
+    /* Map-size mismatch fix, mirroring cmplog_fsrv's own precedent just
+       above (afl->cmplog_fsrv.map_size = MAX(afl->map_size,
+       DEFAULT_SHMEM_SIZE)): afl_fsrv_init_dup() clones afl->fsrv.map_size
+       as-is, which by this point may already have been *shrunk* down to the
+       main binary's real (small) edge count via the coverage-map-size
+       handshake. A dtaint binary built by a completely separate toolchain
+       (dfsan_legacy/angora_dfsan_clang.sh, real DFSan, no AFL coverage
+       instrumentation at all) never participates in that shrink -- it
+       reports afl-compiler-rt.o's uninstrumented default (MAP_SIZE, 65536),
+       which is larger than the shrunk value and gets rejected by
+       afl_fsrv_start()'s map-size sanity check. Confirmed via a real
+       AFL_DEBUG=1 run: both forkservers came up fine, then afl-fuzz
+       PROGRAM-ABORTed with "Target's coverage map size of 65536 is larger
+       than the one this AFL++ is set with (64)". Declaring room for the
+       full default here is safe specifically *because* this dtaint binary
+       has no coverage instrumentation at all -- nothing ever actually
+       writes into afl->dtaint_fsrv.trace_bits, so there's no out-of-bounds
+       write risk the way there would be for a real second coverage
+       consumer (unlike cmplog, this doesn't need the accompanying shm
+       resize-and-restart dance). */
+    afl->dtaint_fsrv.map_size = MAX(afl->dtaint_fsrv.map_size, (u32)DEFAULT_SHMEM_SIZE);
 
     afl_fsrv_start(&afl->dtaint_fsrv, afl->argv, &afl->stop_soon,
                    afl->afl_env.afl_debug_child);

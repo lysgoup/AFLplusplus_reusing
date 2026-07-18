@@ -60,7 +60,7 @@ int dtaint_len_label_is_len(dtaint_label_t lb) {
 
 }
 
-static dtaint_label_t get_len_sublabel(dtaint_label_t lb) {
+dtaint_label_t dtaint_len_label_get_sublabel(dtaint_label_t lb) {
 
   return (lb >> NORMAL_LABEL_WIDTH) & LEN_LABEL_MASK;
 
@@ -72,9 +72,9 @@ dtaint_label_t dtaint_len_label_get_normal(dtaint_label_t lb) {
 
 }
 
-static dtaint_label_t fat_label(dtaint_label_t normal_lb, dtaint_label_t len_lb) {
+dtaint_label_t dtaint_len_label_attach(dtaint_label_t normal_lb, dtaint_label_t len_sublabel) {
 
-  return (len_lb << NORMAL_LABEL_WIDTH) | normal_lb;
+  return (len_sublabel << NORMAL_LABEL_WIDTH) | normal_lb;
 
 }
 
@@ -86,7 +86,7 @@ dtaint_label_t dtaint_len_label_new(uint32_t offset, uint32_t size) {
 
     uint32_t lb = len_info_len;
     len_info_push(offset, size);
-    return fat_label(0, lb);
+    return dtaint_len_label_attach(0, lb);
 
   }
 
@@ -101,12 +101,12 @@ int dtaint_len_label_extract(struct dtaint_cond_record *cond,
 
   if (dtaint_len_label_is_len(cond->lb1)) {
 
-    len_lb = get_len_sublabel(cond->lb1);
+    len_lb = dtaint_len_label_get_sublabel(cond->lb1);
     cond->lb1 = dtaint_len_label_get_normal(cond->lb1);
 
   } else if (dtaint_len_label_is_len(cond->lb2)) {
 
-    len_lb = get_len_sublabel(cond->lb2);
+    len_lb = dtaint_len_label_get_sublabel(cond->lb2);
     cond->lb2 = dtaint_len_label_get_normal(cond->lb2);
 
   } else {

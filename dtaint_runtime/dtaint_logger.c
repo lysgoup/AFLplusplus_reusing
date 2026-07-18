@@ -164,32 +164,81 @@ void dtaint_logger_save_magic_bytes(int cond_index, const void *buf1, u32 len1,
 
 /* ---------------------------------------------------------------------- */
 /* order_map: HashMap<(cmpid, context), u32> -- context is always 0 in    */
-/* this port (see include/dtaint.h), so the key reduces to cmpid, and     */
-/* since cmpid is a dense per-build monotonic counter, a plain growable    */
-/* array indexed by cmpid stands in for the Rust HashMap. Mirrors          */
-/* Logger::get_order exactly.                                              */
+/* this port (see include/dtaint.h), so the key reduces to cmpid. A real   */
+/* open-addressing hash table, not a plain array indexed by cmpid: the     */
+/* custom-pass phase's cmpid was a small dense monotonic counter (array-   */
+/* indexing was fine there), but the real-DFSan phase's cmpid is Angora's   */
+/* actual getInstructionId() -- an arbitrary, sparse 32-bit hash. Indexing  */
+/* an array by a raw cmpid like that tries to allocate/memset a multi-     */
+/* gigabyte array for a single lookup -- confirmed by testing (a "hang"     */
+/* that was actually a multi-GB realloc+memset, not an infinite loop).      */
+/* Mirrors Logger::get_order's *behavior*, not its Rust HashMap's storage.  */
 /* ---------------------------------------------------------------------- */
 
-static u32 *order_counts = NULL;
-static u32  order_counts_cap = 0;
+#define ORDER_MAP_EMPTY 0xFFFFFFFFU
 
-static u32 get_order(struct dtaint_cond_record *cond) {
+static u32 *order_keys = NULL;   /* ORDER_MAP_EMPTY means unused slot */
+static u32 *order_vals = NULL;
+static u32  order_cap = 0;
+static u32  order_len = 0;
 
-  u32 cmpid = cond->cmpid;
+static void order_map_insert(u32 *keys, u32 *vals, u32 cap, u32 key, u32 val) {
 
-  if (cmpid >= order_counts_cap) {
+  u32 idx = key % cap;
 
-    u32 new_cap = order_counts_cap ? order_counts_cap * 2 : 1024;
-    while (cmpid >= new_cap) new_cap *= 2;
-    u32 *grown = realloc(order_counts, (size_t)new_cap * sizeof(u32));
-    if (!grown) abort();
-    memset(grown + order_counts_cap, 0, (size_t)(new_cap - order_counts_cap) * sizeof(u32));
-    order_counts = grown;
-    order_counts_cap = new_cap;
+  while (keys[idx] != ORDER_MAP_EMPTY) idx = (idx + 1) % cap;
+
+  keys[idx] = key;
+  vals[idx] = val;
+
+}
+
+static void order_map_grow(void) {
+
+  u32 new_cap = order_cap ? order_cap * 2 : 1024;
+  u32 *new_keys = malloc((size_t)new_cap * sizeof(u32));
+  u32 *new_vals = malloc((size_t)new_cap * sizeof(u32));
+  if (!new_keys || !new_vals) abort();
+  memset(new_keys, 0xFF, (size_t)new_cap * sizeof(u32));
+
+  for (u32 i = 0; i < order_cap; i++)
+    if (order_keys[i] != ORDER_MAP_EMPTY)
+      order_map_insert(new_keys, new_vals, new_cap, order_keys[i], order_vals[i]);
+
+  free(order_keys);
+  free(order_vals);
+  order_keys = new_keys;
+  order_vals = new_vals;
+  order_cap = new_cap;
+
+}
+
+/* Returns a pointer to the (possibly newly-zeroed) counter slot for
+   `cmpid`, growing/rehashing first if the table is more than half full. */
+static u32 *order_map_get(u32 cmpid) {
+
+  if (order_cap == 0 || order_len * 2 >= order_cap) order_map_grow();
+
+  u32 idx = cmpid % order_cap;
+
+  while (order_keys[idx] != ORDER_MAP_EMPTY && order_keys[idx] != cmpid)
+    idx = (idx + 1) % order_cap;
+
+  if (order_keys[idx] == ORDER_MAP_EMPTY) {
+
+    order_keys[idx] = cmpid;
+    order_vals[idx] = 0;
+    order_len++;
 
   }
 
-  u32 *order = &order_counts[cmpid];
+  return &order_vals[idx];
+
+}
+
+static u32 get_order(struct dtaint_cond_record *cond) {
+
+  u32 *order = order_map_get(cond->cmpid);
 
   if (cond->order == 0) *order = *order + 1;
   cond->order += *order;

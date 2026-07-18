@@ -32,12 +32,35 @@
 
 #include "dtaint_tagset.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Forward-declared here to avoid a circular include with dtaint_logger.h;
    defined in dtaint.h (the wire-format / CondStmtBase-equivalent). */
 struct dtaint_cond_record;
 
 int      dtaint_len_label_is_len(dtaint_label_t lb);
 dtaint_label_t dtaint_len_label_get_normal(dtaint_label_t lb);
+
+/* Extracts the raw len sub-label id (0 if `lb` isn't a length label at
+   all). Mirrors len_label.rs's get_len_label(). Used together with
+   dtaint_len_label_attach() by callers (dfsan.cc's redirected
+   union/mark_signed/infer_shape/combine_and) that must strip a length
+   label down to its plain TagSet id before touching the tag tree, then
+   (for combine/combine_n specifically) re-attach the same sub-label id to
+   the result -- exactly mirroring tag_set_wrap.rs's __angora_tag_set_combine
+   /_combine_n, which is the real precedent this was found missing against
+   (confirmed via a real SIGSEGV: dtaint_tagset_infer_shape2() was being
+   called with a raw, unstripped fat label -- see dfsan_legacy/dfsan_rt/
+   dfsan/dfsan.cc's dfsan_infer_shape_in_math_op for the fix). */
+dtaint_label_t dtaint_len_label_get_sublabel(dtaint_label_t lb);
+
+/* Rewraps an already-combined plain TagSet label with a previously
+   extracted len sub-label id (0 means "no length label involved" and this
+   is just the identity function). Mirrors len_label.rs's get_fat_label(). */
+dtaint_label_t dtaint_len_label_attach(dtaint_label_t normal_lb,
+                                       dtaint_label_t len_sublabel);
 
 /* Records that the `size` bytes at file offset `offset` were the source of
    a length value (e.g. the return value of a read() call), and returns a
@@ -52,5 +75,9 @@ dtaint_label_t dtaint_len_label_new(uint32_t offset, uint32_t size);
    neither operand carried a length label. */
 int dtaint_len_label_extract(struct dtaint_cond_record *cond,
                              struct dtaint_cond_record *len_cond);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

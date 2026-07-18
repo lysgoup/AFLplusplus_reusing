@@ -21,6 +21,10 @@
 
 #include "dtaint.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Seeds `len` fresh per-byte labels at file offset [offset, offset+len),
    tagging the shadow table at `ptr`. Like dtaint_source_buf, but lets ABI-
    list source wrappers (dtaint_abi.c) record the real file position they
@@ -30,5 +34,9 @@ void dtaint_source_at_offset(const void *ptr, u64 len, u32 offset);
 /* Copies shadow labels byte-for-byte from `src` to `dst` (overlap-safe, like
    memmove). Used by the memcpy/memmove/strcpy/strncpy/strcat wrappers. */
 void __dtaint_propagate_mem(const void *dst, const void *src, u64 len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -32,6 +32,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef uint32_t dtaint_label_t;
 
 /* Mirrors tag_set.rs's TagSeg (angora_common::tag::TagSeg). */
@@ -93,5 +97,9 @@ uint32_t dtaint_tagset_find(dtaint_label_t lb, dtaint_tag_seg_t *out,
 
 /* Diagnostic only, mirrors TagSet::get_num_nodes. */
 uint32_t dtaint_tagset_num_nodes(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

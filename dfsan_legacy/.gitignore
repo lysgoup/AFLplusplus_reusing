@@ -1,0 +1,7 @@
+# Build artifacts (rebuild via this directory's README.md) -- CMake cache
+# entries embed absolute host paths, and the .so/.a/.o outputs are large and
+# trivially regenerated.
+/build/
+/build_pass/
+/build_rt/
+/install/

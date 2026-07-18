@@ -194,6 +194,14 @@ static uint32_t insert_n_ones(uint32_t cur_lb, uint32_t num, uint32_t last_one_l
 
 dtaint_label_t dtaint_tagset_insert(uint32_t offset) {
 
+  /* Lazy self-init: in the real-DFSan build, the first call into this
+     module can happen from a source wrapper (e.g. __dfsw_read) called
+     during normal execution, well after any unsafe-to-malloc early-init
+     window -- but there is no other guaranteed call site that runs first,
+     so every public entry point guards itself. Confirmed necessary by a
+     real SIGSEGV (nodes was still NULL here without this). */
+  dtaint_tagset_init();
+
   uint32_t cur_lb = insert_n_zeros(ROOT, offset, ROOT);
   cur_lb = insert_n_ones(cur_lb, 1, ROOT);
   return cur_lb;
@@ -271,7 +279,15 @@ static uint32_t infer_shape(uint32_t l1, uint32_t l2, uint32_t len) {
 
 void dtaint_tagset_infer_shape2(dtaint_label_t lb, uint32_t len) {
 
-  if (lb == ROOT || nodes[lb].begin + 1 < nodes[lb].end) return;
+  /* Bounds check before the first nodes[] access, unlike set_sign/get_sign/
+     combine_and above -- this was the site of a real SIGSEGV: a length
+     label (see dtaint_len_label.h) that reached here unstripped decodes to
+     a huge out-of-range "label" (e.g. 1<<22), and this function, unlike
+     those three, had no `lb < nodes_len` guard at all. The actual fix is
+     stripping length labels before they ever reach here (dfsan.cc's
+     dfsan_infer_shape_in_math_op, dtaint_legacy_hooks.c's cmp/switch
+     hooks); this bounds check is defense in depth, not a substitute. */
+  if (lb == ROOT || lb >= nodes_len || nodes[lb].begin + 1 < nodes[lb].end) return;
 
   uint32_t cur_lb = lb;
 
@@ -292,6 +308,8 @@ void dtaint_tagset_infer_shape2(dtaint_label_t lb, uint32_t len) {
 }
 
 dtaint_label_t dtaint_tagset_combine(dtaint_label_t l1, dtaint_label_t l2) {
+
+  dtaint_tagset_init(); /* defensive; see dtaint_tagset_insert()'s comment */
 
   if (l1 == 0) return l2;
   if (l2 == 0 || l1 == l2) return l1;
@@ -375,6 +393,8 @@ dtaint_label_t dtaint_tagset_combine(dtaint_label_t l1, dtaint_label_t l2) {
 
 dtaint_label_t dtaint_tagset_combine_n(const dtaint_label_t *lbs, uint32_t n, int infer) {
 
+  dtaint_tagset_init(); /* defensive; see dtaint_tagset_insert()'s comment */
+
   uint32_t i = 0;
   while (i < n && lbs[i] == ROOT) i++;
 
@@ -400,6 +420,13 @@ dtaint_label_t dtaint_tagset_combine_n(const dtaint_label_t *lbs, uint32_t n, in
 }
 
 uint32_t dtaint_tagset_find(dtaint_label_t lb, dtaint_tag_seg_t *out, uint32_t cap) {
+
+  dtaint_tagset_init(); /* defensive; see dtaint_tagset_insert()'s comment */
+
+  /* Defensive bounds check, same rationale as dtaint_tagset_infer_shape2:
+     an out-of-range (e.g. unstripped length-label) `lb` must never reach
+     nodes[lb] below. */
+  if (lb >= nodes_len) return 0;
 
   uint32_t n = 0;
   uint32_t last_begin = MAX_LB;

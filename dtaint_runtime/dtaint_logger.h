@@ -22,6 +22,10 @@
 
 #include "dtaint.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Saves one comparison-site record, mirrors Logger::save: drops it silently
    if both labels are untainted, extracts a len_label sidecar record if
    present, computes `order` and drops the record if it exceeds
@@ -36,5 +40,9 @@ int dtaint_logger_save(struct dtaint_cond_record *cond);
    returned by dtaint_logger_save). Mirrors Logger::save_magic_bytes. */
 void dtaint_logger_save_magic_bytes(int cond_index, const void *buf1, u32 len1,
                                     const void *buf2, u32 len2);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
