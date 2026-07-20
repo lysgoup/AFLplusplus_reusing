@@ -233,3 +233,181 @@ void __dfsw___angora_trace_exploit_val_tt(u32 cmpid, u32 context, u32 size,
   dtaint_logger_save(&rec);
 
 }
+
+/* Ubuntu Noble's glibc (2.38+) declares strtol/strtoul/strtoll/strtoull with
+   a GCC __asm__-label redirect to __isoc23_-prefixed symbols (new ISO C23
+   error-handling semantics) -- confirmed via -emit-llvm that the *IR* still
+   shows a plain @strtol call/declare (DFSanPass's abilist match on "strtol"
+   fires correctly, generating the expected dfsw$strtol custom-wrapper
+   reference dfsan_custom.cc already satisfies), but something in cflow/
+   gnulib takes strtol's *address* (assigns it to a function pointer, common
+   in argument-parsing code that accepts a conversion callback), which
+   DFSanPass handles differently: it expects an "instrumented-style" symbol
+   under the *renamed* name (DataFlowSanitizer::addGlobalNamePrefix's "dfs$"
+   prefix -- see pass/DFSanPass.cc), not the custom-wrapper "dfsw$" prefix.
+   Since the asm-label redirect is a property of the *declaration*, this
+   renamed reference also carries it through: the linker ends up wanting
+   "dfs$__isoc23_strtol", which nothing provides (we don't have glibc's own
+   source to instrument, and DFSan only auto-synthesizes "dfs$" trampolines
+   for functions it actually compiles a body for in *this* module). Found
+   via a real link failure building cflow (which parses its command line
+   with strtol): "undefined reference to `dfs$__isoc23_strtol'".
+
+   Fix: hand-write these "dfs$" trampolines directly, matching DFSan's
+   default IA_TLS instrumented-function ABI exactly (confirmed via
+   DataFlowSanitizer::getInstrumentedABI(): IA_TLS is the default unless
+   -angora-dfsan-args-abi is explicitly passed, which this build never
+   does) -- same signature as the real function, argument labels read from
+   __dfsan_arg_tls[i] (one slot per argument, in order), result label
+   written to __dfsan_retval_tls, delegating the actual taint-aware logic
+   to dfsan_custom.cc's existing __dfsw_strtol/etc (the same implementation
+   the plain, non-redirected call path already uses correctly). "dfs$" is
+   not a legal identifier by itself but clang accepts '$' as a non-standard
+   extension in identifiers; __asm__() pins the exact linker symbol name
+   regardless, so this doesn't depend on that extension being enabled. */
+extern long int __dfsw_strtol(const char *nptr, char **endptr, int base,
+                              dfsan_label nptr_label, dfsan_label endptr_label,
+                              dfsan_label base_label, dfsan_label *ret_label);
+extern unsigned long int __dfsw_strtoul(const char *nptr, char **endptr,
+                                        int base, dfsan_label nptr_label,
+                                        dfsan_label endptr_label,
+                                        dfsan_label base_label,
+                                        dfsan_label *ret_label);
+extern long long int __dfsw_strtoll(const char *nptr, char **endptr, int base,
+                                    dfsan_label nptr_label,
+                                    dfsan_label endptr_label,
+                                    dfsan_label base_label,
+                                    dfsan_label *ret_label);
+extern unsigned long long int __dfsw_strtoull(const char *nptr, char **endptr,
+                                              int base, dfsan_label nptr_label,
+                                              dfsan_label endptr_label,
+                                              dfsan_label base_label,
+                                              dfsan_label *ret_label);
+
+/* Must match dfsan.cc's THREADLOCAL storage class exactly (expands to
+   __thread on non-Windows -- sanitizer_internal_defs.h) or the linker
+   rejects the two objects' declarations of the same symbol as
+   incompatible ("TLS definition ... mismatches non-TLS reference"). */
+extern __thread dfsan_label __dfsan_arg_tls[64];
+extern __thread dfsan_label __dfsan_retval_tls;
+
+long int dtaint_dfs_isoc23_strtol(const char *nptr, char **endptr, int base)
+    __asm__("dfs$__isoc23_strtol");
+long int dtaint_dfs_isoc23_strtol(const char *nptr, char **endptr, int base) {
+  dfsan_label ret_label;
+  long int ret = __dfsw_strtol(nptr, endptr, base, __dfsan_arg_tls[0],
+                               __dfsan_arg_tls[1], __dfsan_arg_tls[2],
+                               &ret_label);
+  __dfsan_retval_tls = ret_label;
+  return ret;
+}
+
+unsigned long int dtaint_dfs_isoc23_strtoul(const char *nptr, char **endptr,
+                                            int base)
+    __asm__("dfs$__isoc23_strtoul");
+unsigned long int dtaint_dfs_isoc23_strtoul(const char *nptr, char **endptr,
+                                            int base) {
+  dfsan_label ret_label;
+  unsigned long int ret =
+      __dfsw_strtoul(nptr, endptr, base, __dfsan_arg_tls[0],
+                    __dfsan_arg_tls[1], __dfsan_arg_tls[2], &ret_label);
+  __dfsan_retval_tls = ret_label;
+  return ret;
+}
+
+long long int dtaint_dfs_isoc23_strtoll(const char *nptr, char **endptr,
+                                        int base)
+    __asm__("dfs$__isoc23_strtoll");
+long long int dtaint_dfs_isoc23_strtoll(const char *nptr, char **endptr,
+                                        int base) {
+  dfsan_label ret_label;
+  long long int ret =
+      __dfsw_strtoll(nptr, endptr, base, __dfsan_arg_tls[0],
+                    __dfsan_arg_tls[1], __dfsan_arg_tls[2], &ret_label);
+  __dfsan_retval_tls = ret_label;
+  return ret;
+}
+
+unsigned long long int dtaint_dfs_isoc23_strtoull(const char *nptr,
+                                                  char **endptr, int base)
+    __asm__("dfs$__isoc23_strtoull");
+unsigned long long int dtaint_dfs_isoc23_strtoull(const char *nptr,
+                                                  char **endptr, int base) {
+  dfsan_label ret_label;
+  unsigned long long int ret =
+      __dfsw_strtoull(nptr, endptr, base, __dfsan_arg_tls[0],
+                     __dfsan_arg_tls[1], __dfsan_arg_tls[2], &ret_label);
+  __dfsan_retval_tls = ret_label;
+  return ret;
+}
+
+/* Ported from Angora_original/llvm_mode/external_lib/zlib_func.c: of every
+   zlib function, Angora gives only crc32 a precise custom model (see
+   rules/zlib_custom_abilist.txt) -- everything else (inflate/deflate/gz*)
+   stays `discard` in both Angora and this build. crc32 is singled out
+   because it's a common "is this data corrupted" gate (e.g. PNG chunk
+   validation) that fuzzers need to satisfy to reach interesting code past
+   it; discarding it entirely (this build's previous behavior, before this
+   was found missing) would have meant no input bytes could ever be
+   correlated with failing that check.
+
+   Declared with zlib's real argument types spelled out directly (unsigned
+   long, const unsigned char pointer, unsigned int for uLong/Bytef/uInt)
+   rather than
+   #include <zlib.h> -- this file is compiled once into the shared runtime
+   archive, not per-target, and doesn't otherwise need zlib's headers
+   installed in that build environment; the real crc32() symbol itself is
+   resolved at each target's own link time from whatever libz it already
+   links against.
+
+   __attribute__((weak)): a real link failure, found immediately after
+   adding this -- dtaint_legacy_hooks.o lives in the runtime archive linked
+   into *every* dtaint binary unconditionally (unlike Angora's own
+   zlib_func.c, built as a separate ZlibRt static library only linked into
+   targets that actually use zlib), so a hard extern reference to crc32()
+   broke every target that doesn't link libz at all ("undefined reference
+   to `crc32'" building a trivial test program with no -lz in sight).
+   `weak` makes this a weak-undefined reference instead: it resolves
+   normally for targets that do link libz (which is every target that
+   could ever actually reach __dfsw_crc32 in the first place, since DFSan
+   only redirects here for programs that call the real crc32()), and
+   simply never gets resolved -- harmlessly, since __dfsw_crc32 is then
+   also never called -- for targets that don't. */
+extern unsigned long crc32(unsigned long crc, const unsigned char *buf,
+                           unsigned int len) __attribute__((weak));
+
+unsigned long __dfsw_crc32(unsigned long crc, const unsigned char *buf,
+                          unsigned int len, dfsan_label crc_label,
+                          dfsan_label buf_label, dfsan_label len_label,
+                          dfsan_label *ret_label) {
+  dfsan_label lb = dfsan_union(crc_label, len_label);
+  lb = dfsan_union(lb, dfsan_read_label(buf, len));
+  unsigned long ret = crc32(crc, buf, len);
+  *ret_label = lb;
+  return ret;
+}
+
+/* Same "dfs$" indirect-call-style trampoline requirement found with
+   strtol/isoc23 above -- a real target that actually calls crc32() needs
+   "dfs$crc32", not just the "dfsw$crc32" name pointing at __dfsw_crc32
+   above (confirmed via a real link failure: "undefined reference to
+   `dfs$crc32'" compiling a trivial crc32-calling test program, even though
+   crc32 is a plain external declaration in this TU with no glibc-style
+   asm-label redirect at play here -- whatever exactly triggers DFSanPass
+   to want an "instrumented-style" reference for a *particular* external
+   symbol, hand-writing the trampoline directly matching DFSan's default
+   IA_TLS ABI (same signature as the real function, args read from
+   __dfsan_arg_tls[i], result label written to __dfsan_retval_tls) sidesteps
+   needing to fully understand why, same as the isoc23 case). */
+unsigned long dtaint_dfs_crc32(unsigned long crc, const unsigned char *buf,
+                               unsigned int len) __asm__("dfs$crc32");
+unsigned long dtaint_dfs_crc32(unsigned long crc, const unsigned char *buf,
+                               unsigned int len) {
+  dfsan_label ret_label;
+  unsigned long ret = __dfsw_crc32(crc, buf, len, __dfsan_arg_tls[0],
+                                   __dfsan_arg_tls[1], __dfsan_arg_tls[2],
+                                   &ret_label);
+  __dfsan_retval_tls = ret_label;
+  return ret;
+}
+

@@ -21,6 +21,21 @@
 #     produces an object file, not a binary -- the runtime-archive link
 #     flags are only appended when actually linking.
 #
+# A third edge case, found via a real hang debugging `cflow`'s ./configure:
+# when a *combined* compile+link invocation (source file(s) + -o prog, no
+# -c -- exactly what autoconf's AC_LINK_IFELSE/AC_RUN_IFELSE probes do) also
+# needs our runtime archives appended, mixing -Xclang -load pass-loading
+# flags with a positional .a argument in the *same* clang invocation hits a
+# real clang-11 driver bug: it misidentifies the .a as C source needing its
+# own -cc1 compile job (confirmed via `ps` catching a live `-cc1 -E -x c
+# ... libdfsan_rt-x86_64.a` process spinning at 100% CPU trying to
+# preprocess a multi-megabyte binary archive as text -- indistinguishable
+# from an unkillable hang from the outside). An explicit `-x none` before
+# our appended files does *not* prevent this. The actual fix: never mix
+# -Xclang -load with .o/.a file arguments in one invocation -- split into a
+# real two-phase compile-then-link whenever there's source to compile *and*
+# linking is also requested (compile_and_link, below).
+#
 # Invoke as (or symlink to) *_clang++ for C++ mode; anything else uses C.
 #
 # Usage:
@@ -55,6 +70,7 @@ RULES_DIR="${HERE}/rules"
 
 maybe_assembler=0
 maybe_linking=1
+source_files=()
 
 for arg in "$@"; do
     case "$arg" in
@@ -62,6 +78,9 @@ for arg in "$@"; do
     esac
     case "$arg" in
         -c|-S|-E|-shared) maybe_linking=0 ;;
+    esac
+    case "$arg" in
+        *.c|*.cc|*.cpp|*.cxx|*.C) source_files+=( "$arg" ) ;;
     esac
 done
 
@@ -73,6 +92,11 @@ if [ "$maybe_assembler" -eq 0 ]; then
         -mllvm -TrackMode
         -mllvm "-angora-dfsan-abilist=${RULES_DIR}/angora_abilist.txt"
         -mllvm "-angora-dfsan-abilist=${RULES_DIR}/dfsan_abilist.txt"
+        # Environment-compatibility fix, not target-specific like
+        # ANGORA_TAINT_RULE_LIST below -- always applied. See
+        # runtime/dtaint_legacy_hooks.c's __dfsw___isoc23_* wrappers.
+        -mllvm "-angora-dfsan-abilist=${RULES_DIR}/isoc23_abilist.txt"
+        -mllvm "-angora-dfsan-abilist=${RULES_DIR}/zlib_custom_abilist.txt"
         -mllvm "-angora-exploitation-list=${RULES_DIR}/exploitation_list.txt"
     )
     # Optional extra "discard taint through this library" abilist -- mirrors
@@ -93,6 +117,8 @@ if [ "$maybe_assembler" -eq 0 ]; then
         -Xclang -load -Xclang "${PASS_DIR}/libDFSanPass.so"
         -mllvm "-angora-dfsan-abilist2=${RULES_DIR}/angora_abilist.txt"
         -mllvm "-angora-dfsan-abilist2=${RULES_DIR}/dfsan_abilist.txt"
+        -mllvm "-angora-dfsan-abilist2=${RULES_DIR}/isoc23_abilist.txt"
+        -mllvm "-angora-dfsan-abilist2=${RULES_DIR}/zlib_custom_abilist.txt"
     )
     if [ -n "$ANGORA_TAINT_RULE_LIST" ]; then
         pass_flags+=( -mllvm "-angora-dfsan-abilist2=${ANGORA_TAINT_RULE_LIST}" )
@@ -137,10 +163,85 @@ if [ -z "$ANGORA_DONT_OPTIMIZE" ]; then
     opt_flags=( -g -O3 -funroll-loops )
 fi
 
+# No -I into our own include/ or dtaint_runtime/ dirs here -- a real bug
+# found via a real target: AFL++'s top-level include/ has its own
+# config.h and hash.h (AFL++ tunables / hash function, nothing to do with
+# autoconf), and putting that dir ahead of a target's *own* -I. -I.. put
+# AFL++'s config.h in front of cflow's real, autoconf-generated one for any
+# quote-include, silently breaking every gnulib header that guards itself
+# on config.h's own include-once macro ("Please include config.h first.").
+# Nothing this wrapper compiles on a *target's* behalf needs our internal
+# runtime headers anyway -- those are only included when io_func.c/
+# dtaint_legacy_hooks.c/etc. are compiled directly (see the top-level
+# Dockerfile), never through this script.
+common_includes=( -pie -fpic -Qunused-arguments )
+
+if [ "$maybe_linking" -eq 1 ] && [ "${#source_files[@]}" -gt 0 ] && [ "$maybe_assembler" -eq 0 ]; then
+    # compile_and_link: a combined "compile this source and link it into a
+    # binary" invocation (autoconf probes, or a trivial `cc -o prog prog.c`
+    # build step) -- see this file's header comment for why this can't be
+    # one clang invocation like the -c-only and link-only cases below.
+    # Phase 1: compile each source file to a temp .o *with* the
+    # instrumentation passes, nothing link-related on this command line at
+    # all (no runtime archives, no -Wl flags -- exactly like a real -c step).
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "$tmpdir"' EXIT
+
+    objs=()
+    other_args=()
+    skip_next=0
+    prev_was_o=0
+    for arg in "$@"; do
+        if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
+        case "$arg" in
+            -o) skip_next=1; continue ;;
+        esac
+        case "$arg" in
+            *.c|*.cc|*.cpp|*.cxx|*.C) continue ;;  # handled via source_files
+        esac
+        other_args+=( "$arg" )
+    done
+
+    n=0
+    for src in "${source_files[@]}"; do
+        n=$((n + 1))
+        obj="${tmpdir}/obj${n}.o"
+        "$CLANG" "${pass_flags[@]}" "${common_includes[@]}" "${other_args[@]}" \
+            "${opt_flags[@]}" -c "$src" -o "$obj"
+        objs+=( "$obj" )
+    done
+
+    # Phase 2: link the freshly-compiled .o(s) together with whatever
+    # other .o/.a/-l arguments were on the original command line, plus our
+    # own runtime archives -- a plain link, no -Xclang -load in sight, so
+    # the driver never has a reason to misidentify any .a as source.
+    out="a.out"
+    skip_next=0
+    for arg in "$@"; do
+        if [ "$skip_next" -eq 1 ]; then out="$arg"; skip_next=0; continue; fi
+        case "$arg" in
+            -o) skip_next=1 ;;
+        esac
+    done
+
+    exec "$CLANG" "${common_includes[@]}" "${other_args[@]}" "${objs[@]}" \
+        "${opt_flags[@]}" "${link_flags[@]}" -o "$out"
+fi
+
+# -c-only (no linking) or link-only (no source files, e.g. linking
+# already-compiled .o files from separate earlier -c invocations) cases:
+# a single invocation is safe here since pass_flags and .a/.o positional
+# args never both appear together (pass_flags is only meaningful when
+# there's source to instrument, i.e. maybe_linking is 0 here, or this is a
+# no-source link where -Xclang -load wouldn't do anything anyway and could
+# still trip the same driver bug, so skip it).
+if [ "$maybe_linking" -eq 1 ]; then
+    pass_flags=()
+fi
+
 exec "$CLANG" \
     "${pass_flags[@]}" \
-    -pie -fpic -Qunused-arguments \
-    -I "${HERE}/../include" -I "${HERE}/../dtaint_runtime" \
+    "${common_includes[@]}" \
     "$@" \
     "${opt_flags[@]}" \
     "${link_flags[@]}"
