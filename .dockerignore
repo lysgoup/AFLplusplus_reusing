@@ -73,3 +73,7 @@ test/unittests/unit_rand
 unicorn_mode/samples/*/\.test-*
 unicorn_mode/samples/*/output
 unicorn_mode/unicornafl
+dfsan_legacy/build
+dfsan_legacy/build_pass
+dfsan_legacy/build_rt
+dfsan_legacy/install

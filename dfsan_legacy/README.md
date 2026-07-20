@@ -169,6 +169,72 @@ DFSAN_LEGACY_LLVM_DIR=/opt/clang+llvm-11 ./angora_dfsan_clang.sh \
    (mirrors, but is simpler than, `cmplog_fsrv`'s own resize-and-restart
    handling of the same underlying issue).
 
+6. **`gen_library_abilist.sh`-generated rules silently no-op on libraries
+   with ELF symbol versioning** -- `nm -D` emits versioned names (e.g.
+   `jpeg_read_scanlines@@LIBJPEG_8.0`), but DFSan's abilist matches the bare
+   function name as it appears in the IR (the `@@VERSION` suffix is a
+   dynamic-linker construct, invisible to the compiler), so a generated
+   `fun:jpeg_read_scanlines@@LIBJPEG_8.0=discard` rule never matches --
+   found because it broke `libtiff`'s own `checking for jpeg_read_scanlines
+   in -ljpeg` configure check specifically for this wrapper (reproduced
+   standalone), while the plain `afl-clang-fast` build of the same source
+   linked jpeg fine. Fix (in `Reusing-unibench_build/aflplusplus-reusing-
+   target/Dockerfile`, not this repo): strip `@@VERSION` with
+   `sed 's/@@[^=]*=/=/'` when generating the abilist. Not every library is
+   affected the same way -- `libjbig` has no versioning at all, `libz` only
+   versions some newer symbols -- so this had gone unnoticed until a library
+   whose *every* symbol is versioned was linked.
+7. **`ANGORA_DONT_OPTIMIZE`-equivalent default was missing**: this wrapper
+   never added an optimization flag at all (clang default `-O0`), unlike
+   `angora_clang.c` which always forces `-g -O3 -funroll-loops` (stripping
+   any `-O1/-O2/-O3` the build system passes) unless `ANGORA_DONT_OPTIMIZE`
+   is set. Fixed for fidelity to Angora's actual recipe; confirmed via
+   direct A/B testing on the same seed that this specific gap was *not*
+   the cause of item 8 below (byte-identical dtaint output before/after).
+
+## Cross-validation against Angora-reusing on a real benchmark
+
+Ran both this toolchain's dtaint output and Angora-reusing's own real
+`.taint` binary against the *same* target (`tiffsplit`, libtiff 3.9.7) and
+the same seed corpus (a 6809-file saturated/heavily-fuzzed corpus from
+`Reusing-unibench_build/_saturation/`), converting Angora's native
+bincode-serialized track file to this repo's `dtaint.h` wire format via a
+small new debug binary (`fuzzer/src/bin/dump_dtaint.rs`, added to
+Angora-reusing, *not* this repo -- it just re-serializes data Angora's own
+`get_log_data` parser already produces, no taint-logic changes), then
+diffing the two `.dtaint` files' resolved byte offsets per comparison site.
+
+Findings, after fixing items 6 and 7 above:
+- 97.9% of seeds produce output at all on both sides (a small fraction of
+  the corpus -- specifically inputs with malformed/non-standard TIFF
+  directory structure -- trigger a severe, multi-minute slowdown in this
+  build's taint tracking before the process eventually SIGSEGVs; Angora's
+  own build is far less affected by the same inputs). Not yet root-caused.
+- Of the 6649 seeds both sides produced output for: 100% have overlapping
+  comparison sites (avg Jaccard 0.775), 80.9% of matched-site records agree
+  on `condition`/`op`/`size`/`arg1`/`arg2`, and 92.5% agree on the resolved
+  byte-offset ranges (after merging adjacent/touching ranges, since one
+  side sometimes reports one wider segment where the other reports several
+  narrower adjacent ones covering the identical bytes -- not a real
+  disagreement).
+8. **Open issue**: the remaining ~7.5% offset disagreement is not random --
+   it's a systematic pattern where this build's resolved range starts
+   exactly 2 bytes earlier than Angora's for the same comparison, and
+   correlates with an extra `sign=true` `TagSeg` / `COND_SIGN_MASK` on this
+   build's side that Angora's doesn't have. Ruled out so far: `-O0` vs
+   `-O3` codegen (item 7, disproven by direct A/B test), and `tif_config.h`
+   macro differences between the two toolchains' separate `./configure`
+   runs (a real diff exists -- e.g. `HAVE_STRCASECMP` -- but `tiffsplit`'s
+   own source never references it). Next step if pursued: instrument
+   `dtaint_tagset_infer_shape2`/`dfsan.cc`'s union/combine call sites with
+   temporary tracing and diff the actual sequence of taint-insert calls
+   against Angora's real Rust runtime for one execution, since the shape-
+   inference heuristics (`infer_shape`/`infer_shape2`) depend on the global
+   chronological *order* labels get inserted in, not just their final
+   values -- a difference there, not in the combine logic itself (verified
+   line-for-line identical to `tag_set.rs`), is the leading remaining
+   hypothesis.
+
 ## Known gaps (same boundary as the other phase)
 
 No consumer reads this data back into a mutation strategy -- this is still
