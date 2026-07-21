@@ -215,16 +215,39 @@ if [ "$maybe_linking" -eq 1 ] && [ "${#source_files[@]}" -gt 0 ] && [ "$maybe_as
     # other .o/.a/-l arguments were on the original command line, plus our
     # own runtime archives -- a plain link, no -Xclang -load in sight, so
     # the driver never has a reason to misidentify any .a as source.
+    #
+    # Order matters here: a static archive only pulls in the member object
+    # files needed to resolve symbols some *earlier* object on the link
+    # line actually references (classic single-pass Unix linker
+    # behavior) -- so each compiled source file must keep its ORIGINAL
+    # position relative to any archives on the command line, not be
+    # appended after all of them. Found via a real SQLite link failure:
+    # the real command was `-o sqlite3 shell.c libsqlite3.a ...` (shell.c,
+    # which needs libsqlite3.a's symbols, correctly comes first), but the
+    # earlier version of this script flattened it to "other_args (which
+    # included libsqlite3.a) then objs (shell.o)" -- archive first, so the
+    # linker never pulled sqlite3.o in at all ("undefined reference to
+    # `dfs$sqlite3_step'" etc, even though sqlite3.o genuinely defines it).
     out="a.out"
+    ordered_args=()
     skip_next=0
+    src_idx=0
     for arg in "$@"; do
         if [ "$skip_next" -eq 1 ]; then out="$arg"; skip_next=0; continue; fi
         case "$arg" in
-            -o) skip_next=1 ;;
+            -o) skip_next=1; continue ;;
         esac
+        case "$arg" in
+            *.c|*.cc|*.cpp|*.cxx|*.C)
+                ordered_args+=( "${objs[$src_idx]}" )
+                src_idx=$((src_idx + 1))
+                continue
+                ;;
+        esac
+        ordered_args+=( "$arg" )
     done
 
-    exec "$CLANG" "${common_includes[@]}" "${other_args[@]}" "${objs[@]}" \
+    exec "$CLANG" "${common_includes[@]}" "${ordered_args[@]}" \
         "${opt_flags[@]}" "${link_flags[@]}" -o "$out"
 fi
 

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 #
 # This Dockerfile for AFLplusplus uses Ubuntu 24.04 and
 # installs LLVM 19 for afl-clang-lto support.
@@ -77,7 +78,13 @@ RUN git clone --depth=1 https://github.com/AFLplusplus/cov-analysis && \
     (cd cov-analysis && make install) && rm -rf cov-analysis
 
 WORKDIR /AFLplusplus
-COPY . .
+# dfsan_legacy/ (rules/, angora_dfsan_clang.sh, runtime/) is what actually
+# changes while iterating target-by-target on the dtaint port -- copying it
+# separately, after the expensive AFL++ build + LLVM 11 download/pass/
+# dfsan_rt compilation below, means editing an abilist rule no longer
+# invalidates all of that (was ~8-10 minutes of rebuild per one-line
+# abilist tweak before this split).
+COPY --exclude=dfsan_legacy . .
 
 ARG CC=gcc-$GCC_VERSION
 ARG CXX=g++-$GCC_VERSION
@@ -107,6 +114,8 @@ RUN wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-11.1.
     rm /tmp/llvm11.tar.xz
 
 ENV DFSAN_LEGACY_LLVM_DIR=/opt/clang+llvm-11
+
+COPY dfsan_legacy dfsan_legacy
 
 # The three vendored passes (verified to compile against this exact LLVM
 # release with zero source changes).

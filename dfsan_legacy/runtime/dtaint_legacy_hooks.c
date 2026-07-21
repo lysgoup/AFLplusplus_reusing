@@ -30,6 +30,8 @@
 
  */
 
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "dtaint.h"
@@ -341,6 +343,71 @@ unsigned long long int dtaint_dfs_isoc23_strtoull(const char *nptr,
   return ret;
 }
 
+/* Same isoc23 asm-label redirect as strtol above, this time for sscanf --
+   found via a real link failure building lame (its option parser calls
+   sscanf to read numeric args like "-b 320"): "undefined reference to
+   `dfs$__isoc23_sscanf'". Unlike strtol/crc32, there's no __dfsw_sscanf to
+   delegate to here -- grepping dfsan_rt/dfsan/dfsan_custom.cc (LLVM's own
+   real DFSan custom-function implementations, vendored wholesale) shows it
+   only ever implements the OUTPUT-formatting side (sprintf/snprintf);
+   upstream DFSan itself does not attempt precise per-argument taint
+   propagation through scanf-family input parsing. Matching that same
+   choice: forward to the real vsscanf via a va_list (the only way to
+   correctly pass through an unknown-arity variadic call) and mark the
+   result untainted, rather than inventing ad hoc taint propagation
+   upstream DFSan itself doesn't provide. */
+int dtaint_dfs_isoc23_sscanf(const char *str, const char *format, ...)
+    __asm__("dfs$__isoc23_sscanf");
+int dtaint_dfs_isoc23_sscanf(const char *str, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  int ret = vsscanf(str, format, ap);
+  va_end(ap);
+  __dfsan_retval_tls = 0;
+  return ret;
+}
+
+/* Same story as sscanf immediately above, for fscanf -- found via a real
+   link failure building ncurses' bundled test/demo_panels.c (not the
+   progs/tic binary we actually need, but ncurses' plain `make` builds
+   every demo under test/ regardless). */
+int dtaint_dfs_isoc23_fscanf(FILE *stream, const char *format, ...)
+    __asm__("dfs$__isoc23_fscanf");
+int dtaint_dfs_isoc23_fscanf(FILE *stream, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  int ret = vfscanf(stream, format, ap);
+  va_end(ap);
+  __dfsan_retval_tls = 0;
+  return ret;
+}
+
+/* bcmp is a legacy BSD synonym for memcmp (same signature, same real
+   glibc behavior modulo bcmp's looser "zero vs nonzero" contract, which a
+   memcmp-identical result satisfies). It was left with no real category
+   in the base LLVM abilist (only the vestigial `bcmp=uninstrumented`
+   entry every symbol from that file's auto-generated bulk section has,
+   same as memcmp's own harmless duplicate) -- meaning every bcmp call
+   fell through to DFSan's fully-conservative "uninstrumented function"
+   path, which unions in broad taint state defensively on every single
+   call. Found via a real SQLite build failure: its bundled `lemon`
+   parser-generator tool (itself taint-compiled, run *during* the build to
+   generate parse.c from parse.y) calls bcmp repeatedly while parsing the
+   grammar, and the resulting flood of over-conservative label unions blew
+   through dtaint_tagset's node-table capacity ("more than 4194303 label
+   nodes", aborting the whole build). Marking it `custom` and delegating
+   straight to the existing, precise __dfsw_memcmp (dfsan_custom.cc)
+   fixes both the correctness gap and the label-explosion abort. */
+extern int __dfsw_memcmp(const void *s1, const void *s2, size_t n,
+                         dfsan_label s1_label, dfsan_label s2_label,
+                         dfsan_label n_label, dfsan_label *ret_label);
+
+int __dfsw_bcmp(const void *s1, const void *s2, size_t n,
+                dfsan_label s1_label, dfsan_label s2_label,
+                dfsan_label n_label, dfsan_label *ret_label) {
+  return __dfsw_memcmp(s1, s2, n, s1_label, s2_label, n_label, ret_label);
+}
+
 /* Ported from Angora_original/llvm_mode/external_lib/zlib_func.c: of every
    zlib function, Angora gives only crc32 a precise custom model (see
    rules/zlib_custom_abilist.txt) -- everything else (inflate/deflate/gz*)
@@ -398,9 +465,22 @@ unsigned long __dfsw_crc32(unsigned long crc, const unsigned char *buf,
    symbol, hand-writing the trampoline directly matching DFSan's default
    IA_TLS ABI (same signature as the real function, args read from
    __dfsan_arg_tls[i], result label written to __dfsan_retval_tls) sidesteps
-   needing to fully understand why, same as the isoc23 case). */
+   needing to fully understand why, same as the isoc23 case).
+
+   __attribute__((weak)): a real link failure building binutils-2.28,
+   which bundles its *own* zlib source tree (zlib/crc32.c) rather than
+   linking a prebuilt libz -- when that gets compiled through our DFSan
+   pass like everything else in the target, it's a genuine in-module
+   function body, so DFSan generates its own real "dfs$crc32" for it
+   automatically (the normal, correct case, no trampoline needed at all).
+   That collided with this unconditionally-linked trampoline ("multiple
+   definition of `dfs$crc32'"). Weak makes this one yield to a real
+   definition when a target compiles its own crc32 from source, while
+   still providing the fallback for the (more common) case of linking an
+   external, non-instrumented libz. */
 unsigned long dtaint_dfs_crc32(unsigned long crc, const unsigned char *buf,
-                               unsigned int len) __asm__("dfs$crc32");
+                               unsigned int len)
+    __asm__("dfs$crc32") __attribute__((weak));
 unsigned long dtaint_dfs_crc32(unsigned long crc, const unsigned char *buf,
                                unsigned int len) {
   dfsan_label ret_label;

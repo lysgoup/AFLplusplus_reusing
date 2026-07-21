@@ -1,5 +1,176 @@
 
 ##########
+# libstdc++ GCC cxx11-ABI internals (basic_string, memory alloc/dealloc,
+# exception-throw helpers). Found via a real link failure building exiv2
+# (first C++ unibench target attempted): GCC's libstdc++ keeps the
+# "heavy" basic_string<char> methods (append/assign/substr/push_back/...)
+# as an out-of-line extern-template instantiation living in libstdc++
+# itself, not inlined into caller TUs -- same "external declaration with
+# no local body" pattern as the isoc23_strtol/crc32 fixes elsewhere in
+# this rules/ directory, so DFSan wants a "dfs$"-renamed symbol nothing
+# provides. Unlike those two, there's no meaningful custom taint logic to
+# preserve here (string-internals bookkeeping and memory alloc/exception
+# plumbing aren't comparison sites), so plain discard is the right and
+# sufficient fix, mirroring this file's own already-existing (if sparser)
+# per-symbol exception-destructor entries below (_ZNSt12length_errorD1Ev
+# and friends).
+fun:_ZNSt7__cxx11*=uninstrumented
+fun:_ZNSt7__cxx11*=discard
+fun:_ZNKSt7__cxx11*=uninstrumented
+fun:_ZNKSt7__cxx11*=discard
+fun:_ZSt*throw*=uninstrumented
+fun:_ZSt*throw*=discard
+fun:_Znwm=uninstrumented
+fun:_Znwm=discard
+fun:_Znam=uninstrumented
+fun:_Znam=discard
+fun:_ZdlPv=uninstrumented
+fun:_ZdlPv=discard
+fun:_ZdlPvm=uninstrumented
+fun:_ZdlPvm=discard
+fun:_ZdaPv=uninstrumented
+fun:_ZdaPv=discard
+fun:_ZdaPvm=uninstrumented
+fun:_ZdaPvm=discard
+
+# Itanium C++ ABI exception-handling helpers (libgcc_s/libsupc++, extern
+# "C" so not name-mangled) -- __cxa_throw/allocate_exception/etc are pure
+# control-flow plumbing, same "external, no local body, no taint-relevant
+# behavior" story as above. And the _Rb_tree_* family: std::map/std::set's
+# node-rebalancing logic operates on type-erased _Rb_tree_node_base*, so
+# GCC gives it a single shared (non-template, real extern) implementation
+# in libstdc++ reused across every map/set instantiation, rather than
+# inlining per-instantiation like most STL container logic.
+fun:__cxa_*=uninstrumented
+fun:__cxa_*=discard
+fun:_ZSt*Rb_tree*=uninstrumented
+fun:_ZSt*Rb_tree*=discard
+
+# iostream formatting/state machinery (std::ostream/istream -- "So"/"Si"
+# are Itanium mangling's built-in substitution abbreviations for exactly
+# basic_ostream<char,char_traits<char>>/basic_istream<...>, so these
+# wildcards only match genuine iostream members, nothing user-defined),
+# plus RTTI's dynamic_cast helper and the nothrow operator-new overloads
+# (missed by the plain _Znwm/_Znam entries above, which only cover the
+# non-nothrow overload's exact mangled name). Same story as everything
+# else in this section: formatting/RTTI/allocation plumbing, not a
+# comparison site, so discard is correct.
+fun:_ZNSo*=uninstrumented
+fun:_ZNSo*=discard
+fun:_ZNKSo*=uninstrumented
+fun:_ZNKSo*=discard
+fun:_ZNSi*=uninstrumented
+fun:_ZNSi*=discard
+fun:_ZNKSi*=uninstrumented
+fun:_ZNKSi*=discard
+fun:_ZNSt9basic_ios*=uninstrumented
+fun:_ZNSt9basic_ios*=discard
+fun:_ZNKSt9basic_ios*=uninstrumented
+fun:_ZNKSt9basic_ios*=discard
+fun:_ZNSt8ios_base*=uninstrumented
+fun:_ZNSt8ios_base*=discard
+fun:_ZNKSt8ios_base*=uninstrumented
+fun:_ZNKSt8ios_base*=discard
+fun:_ZSt*ostream_insert*=uninstrumented
+fun:_ZSt*ostream_insert*=discard
+fun:__dynamic_cast=uninstrumented
+fun:__dynamic_cast=discard
+fun:_Znwm*=uninstrumented
+fun:_Znwm*=discard
+fun:_Znam*=uninstrumented
+fun:_Znam*=discard
+
+# Locale facets (ctype<char>::_M_widen_init and friends -- out-of-line
+# extern-template like basic_string above), std::list's type-erased
+# node-linking helpers (_List_node_base, same "_Rb_tree_* for map/set" story
+# but for list), file streams (basic_ifstream/ofstream/fstream, basic_filebuf),
+# and std::operator>>/operator<< template instantiations (Itanium mangles
+# operator>> as "rs" and operator<< as "ls", so _ZStrs*/_ZStls* only matches
+# these two operators in namespace std, whatever the operand type).
+fun:_ZNKSt5ctype*=uninstrumented
+fun:_ZNKSt5ctype*=discard
+fun:_ZNSt5ctype*=uninstrumented
+fun:_ZNSt5ctype*=discard
+fun:_ZNSt8__detail15_List_node_base*=uninstrumented
+fun:_ZNSt8__detail15_List_node_base*=discard
+fun:_ZNSt13basic_filebuf*=uninstrumented
+fun:_ZNSt13basic_filebuf*=discard
+fun:_ZNSt13basic_ifstream*=uninstrumented
+fun:_ZNSt13basic_ifstream*=discard
+fun:_ZNSt13basic_ofstream*=uninstrumented
+fun:_ZNSt13basic_ofstream*=discard
+fun:_ZNSt13basic_fstream*=uninstrumented
+fun:_ZNSt13basic_fstream*=discard
+fun:_ZNSt14basic_ifstream*=uninstrumented
+fun:_ZNSt14basic_ifstream*=discard
+fun:_ZNSt14basic_ofstream*=uninstrumented
+fun:_ZNSt14basic_ofstream*=discard
+fun:_ZNSt14basic_fstream*=uninstrumented
+fun:_ZNSt14basic_fstream*=discard
+fun:_ZStrs*=uninstrumented
+fun:_ZStrs*=discard
+fun:_ZStls*=uninstrumented
+fun:_ZStls*=discard
+fun:_ZSt7getline*=uninstrumented
+fun:_ZSt7getline*=discard
+
+# Standard exception-class hierarchy (constructors/destructors/what()) --
+# a finite, well-known set (libstdc++'s <stdexcept>/<exception>/<new>/
+# <typeinfo>/<functional> exception types), all out-of-line for the same
+# reason as everything else in this file. Adding the whole set now instead
+# of one ad-hoc symbol at a time (this file already had sparse per-symbol
+# entries below for a few of these, e.g. _ZNSt12out_of_rangeD1Ev, added
+# before this broader pass -- kept for reference, now redundant).
+fun:_ZNSt9exception*=uninstrumented
+fun:_ZNSt9exception*=discard
+fun:_ZNKSt9exception*=uninstrumented
+fun:_ZNKSt9exception*=discard
+fun:_ZSt9terminatev=uninstrumented
+fun:_ZSt9terminatev=discard
+fun:_ZNSt11logic_error*=uninstrumented
+fun:_ZNSt11logic_error*=discard
+fun:_ZNKSt11logic_error*=uninstrumented
+fun:_ZNKSt11logic_error*=discard
+fun:_ZNSt12out_of_range*=uninstrumented
+fun:_ZNSt12out_of_range*=discard
+fun:_ZNKSt12out_of_range*=uninstrumented
+fun:_ZNKSt12out_of_range*=discard
+fun:_ZNSt12length_error*=uninstrumented
+fun:_ZNSt12length_error*=discard
+fun:_ZNKSt12length_error*=uninstrumented
+fun:_ZNKSt12length_error*=discard
+fun:_ZNSt13runtime_error*=uninstrumented
+fun:_ZNSt13runtime_error*=discard
+fun:_ZNKSt13runtime_error*=uninstrumented
+fun:_ZNKSt13runtime_error*=discard
+fun:_ZNSt16invalid_argument*=uninstrumented
+fun:_ZNSt16invalid_argument*=discard
+fun:_ZNKSt16invalid_argument*=uninstrumented
+fun:_ZNKSt16invalid_argument*=discard
+fun:_ZNSt11range_error*=uninstrumented
+fun:_ZNSt11range_error*=discard
+fun:_ZNSt14overflow_error*=uninstrumented
+fun:_ZNSt14overflow_error*=discard
+fun:_ZNSt15underflow_error*=uninstrumented
+fun:_ZNSt15underflow_error*=discard
+fun:_ZNSt11domain_error*=uninstrumented
+fun:_ZNSt11domain_error*=discard
+fun:_ZNSt9bad_alloc*=uninstrumented
+fun:_ZNSt9bad_alloc*=discard
+fun:_ZNKSt9bad_alloc*=uninstrumented
+fun:_ZNKSt9bad_alloc*=discard
+fun:_ZNSt8bad_cast*=uninstrumented
+fun:_ZNSt8bad_cast*=discard
+fun:_ZNSt10bad_typeid*=uninstrumented
+fun:_ZNSt10bad_typeid*=discard
+fun:_ZNSt17bad_function_call*=uninstrumented
+fun:_ZNSt17bad_function_call*=discard
+fun:_ZNKSt12__basic_fileIcE*=uninstrumented
+fun:_ZNKSt12__basic_fileIcE*=discard
+fun:_ZNSt12__basic_fileIcE*=uninstrumented
+fun:_ZNSt12__basic_fileIcE*=discard
+
+##########
 # added by user
 #########
 fun:dfsan_mark_signed=uninstrumented
@@ -247,6 +418,7 @@ fun:strtoull=custom
 # necessarily data dependent.
 fun:memchr=custom
 fun:memcmp=custom
+fun:bcmp=custom
 fun:strcasecmp=custom
 fun:strchr=custom
 fun:strcmp=custom
