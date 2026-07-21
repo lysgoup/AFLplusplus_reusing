@@ -1,5 +1,29 @@
 
 ##########
+# Runtime-only "call to uninstrumented function" DFSan warnings (not link
+# failures -- these have no local body in any target, so the default
+# "wants a dfs$ symbol" fallback never even triggers a link error; DFSan
+# just falls through to running the real function and prints a warning).
+# Found via a real exiv2 run against a real seed. gettext/pthread rwlock
+# primitives carry no taint-relevant data-flow of their own (translation
+# lookup, locking), so discard is correct, same reasoning as the rest of
+# this file's runtime-plumbing entries.
+fun:dgettext=uninstrumented
+fun:dgettext=discard
+fun:pthread_rwlock_wrlock=uninstrumented
+fun:pthread_rwlock_wrlock=discard
+fun:pthread_rwlock_rdlock=uninstrumented
+fun:pthread_rwlock_rdlock=discard
+fun:pthread_rwlock_unlock=uninstrumented
+fun:pthread_rwlock_unlock=discard
+fun:pthread_rwlock_destroy=uninstrumented
+fun:pthread_rwlock_destroy=discard
+fun:pthread_rwlock_init=uninstrumented
+fun:pthread_rwlock_init=discard
+fun:mbstowcs=uninstrumented
+fun:mbstowcs=discard
+
+##########
 # libstdc++ GCC cxx11-ABI internals (basic_string, memory alloc/dealloc,
 # exception-throw helpers). Found via a real link failure building exiv2
 # (first C++ unibench target attempted): GCC's libstdc++ keeps the
