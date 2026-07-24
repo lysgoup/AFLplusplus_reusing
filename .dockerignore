@@ -1,8 +1,17 @@
 !/coresight_mode
-*.dSYM
-*.o
-*.pyc
-*.so
+# Bare patterns like `*.o` only match at the build-context ROOT with this
+# Docker/BuildKit version, not recursively into subdirectories -- confirmed
+# via an isolated test (a file at src/foo.o was NOT excluded by a bare
+# `*.o` line, but was excluded once written as `**/*.o`). Found the hard
+# way: stray root-owned .o files left in src/ from an unrelated earlier
+# host-side build (a different, incompatible GCC/LTO version) were still
+# getting copied into aflplusplus-reusing_fuzzer_only's build context and
+# silently shadowing the container's own freshly-built objects, breaking
+# the link with an LTO bytecode version mismatch.
+**/*.dSYM
+**/*.o
+**/*.pyc
+**/*.so
 .sync_tmp
 .test
 .test2
