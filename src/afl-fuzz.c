@@ -3355,6 +3355,44 @@ void afl_load_seeds(afl_state_t *afl) {
 
     }
 
+    // Create a dryrun_finish marker in <out_dir>/queue/signal/ (trivial
+    // caching-path test edit), mirroring angora-reusing's
+    // depot.dirs.signal_dir/dryrun_finish
+    // (fuzzer/src/fuzz_main.rs) -- lets external tooling
+    // (Reusing-unibench_build/tools/archive_queue.sh's find_queue_dir +
+    // dryrun_finish wait) detect "initial seed calibration is done"
+    // uniformly across both fuzzers, so it can tell dry-run base seeds
+    // (already present at this point) apart from later real discoveries.
+    // Best-effort: a failure here is logged but must not abort fuzzing.
+    u8 *dryrun_signal_dir = alloc_printf("%s/queue/signal", afl->out_dir);
+    if (mkdir(dryrun_signal_dir, afl->dir_perm) && errno != EEXIST) {
+
+      WARNF("Could not create dryrun signal dir '%s': %s", dryrun_signal_dir,
+            strerror(errno));
+
+    } else {
+
+      u8 *dryrun_finish_path =
+          alloc_printf("%s/dryrun_finish", dryrun_signal_dir);
+      FILE *dryrun_finish_f = fopen(dryrun_finish_path, "w");
+      if (!dryrun_finish_f) {
+
+        WARNF("Could not create dryrun_finish marker '%s': %s",
+              dryrun_finish_path, strerror(errno));
+
+      } else {
+
+        fclose(dryrun_finish_f);
+        OKF("Created dryrun_finish marker at '%s'.", dryrun_finish_path);
+
+      }
+
+      ck_free(dryrun_finish_path);
+
+    }
+
+    ck_free(dryrun_signal_dir);
+
   }
 
   if (afl->q_testcase_max_cache_entries) {
