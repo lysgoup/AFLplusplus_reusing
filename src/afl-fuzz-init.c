@@ -1417,6 +1417,19 @@ void perform_dry_run(afl_state_t *afl) {
 
     }
 
+    /* Angora-style dry-run policy: taint-track every surviving initial seed,
+       not just ones that later turn out to produce new coverage during
+       fuzzing (that's save_if_interesting()'s separate, narrower policy --
+       see afl-fuzz-bitmap.c). q->disabled here means calibrate_case() above
+       already threw the seed out (crash/timeout without crash_mode), so
+       skipping those mirrors Angora's own crash_or_tmout skip in
+       do_if_has_new()/try_unlimited_memory. */
+    if (unlikely(afl->dtaint_binary) && !q->disabled) {
+
+      log_dtaint_for_new_input(afl, use_mem, read_len, q->fname);
+
+    }
+
     if (unlikely(q->var_behavior && !afl->afl_env.afl_no_warn_instability)) {
 
       WARNF("Instrumentation output varies across runs.");
