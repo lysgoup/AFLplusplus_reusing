@@ -42,13 +42,30 @@ void dtaint_exec_child(afl_forkserver_t *fsrv, char **argv) {
    forkserver's one-time execve() -- see include/dtaint.h's comment on
    DTAINT_TRACK_ENV_VAR for why this can't vary per call). The caller is
    responsible for consuming/renaming that scratch file afterward; nothing
-   here does. */
+   here does.
+
+   Timeout: afl->dtaint_fsrv.exec_tmout, NOT afl->fsrv.exec_tmout. The two
+   start out equal (afl_fsrv_init_dup() clones it at dtaint forkserver setup
+   in src/afl-fuzz.c, before dry run), but afl->fsrv.exec_tmout gets auto-
+   tightened after dry run to ~1.2x the *fast* binary's observed speed (see
+   afl-fuzz.c's `-t ...+` handling) -- nothing ever tightens dtaint_fsrv's
+   copy, so it stays at the original, generous -t value for the whole
+   session. That gap matters here specifically because the dtaint binary is
+   a real-DFSan build with per-call context-tracking overhead (see
+   instrumentation/afl-llvm-dtaint-pass.so.cc), routinely several times
+   slower than the coverage-only fast binary the tightening is based on.
+   Confirmed by testing: using afl->fsrv.exec_tmout here after adding that
+   context instrumentation silently dropped the majority of dtaint_logs
+   entries on larger targets (dtaint runs timing out against a budget sized
+   for the fast binary, no warning -- log_dtaint_for_new_input() doesn't
+   check run_one_dtaint()'s fault status, just whether the scratch file
+   happens to exist afterward). */
 u8 run_one_dtaint(afl_state_t *afl, u8 *out_buf, u32 len) {
 
   u32 tmp_len = write_to_testcase(afl, (void **)&out_buf, len, 0);
   if (likely(tmp_len)) { len = tmp_len; }
 
-  u8 fault = fuzz_run_target(afl, &afl->dtaint_fsrv, afl->fsrv.exec_tmout);
+  u8 fault = fuzz_run_target(afl, &afl->dtaint_fsrv, afl->dtaint_fsrv.exec_tmout);
 
   return fault;
 
