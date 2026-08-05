@@ -17,10 +17,21 @@
      - No real shadow *memory* (page-remapped address translation). Every
        Load/Store is instead instrumented to call into a runtime hook
        backed by a simple address-keyed lookup table.
-     - No function-call context-sensitivity (Angora's opt-in, off-by-
-       default `-c` feature) -- context is always the constant 0, which is
-       exactly what real Angora does with context disabled, not an
-       approximation of it.
+     - Function-call context-sensitivity mirrors Angora's own AngoraPass.cc
+       (addFnWrap/processCall/countEdge): a global __dtaint_context i32,
+       XORed with a per-call-site id at each function entry and restored at
+       each return/resume (recursion-safe -- XORing the same id in twice
+       cancels out). Unlike Angora's `num_fn_ctx`-gated depth decay (its
+       opt-in, off-by-default `-c` *shift*), this always runs at full depth
+       with no decay, matching the actual observed behavior of angora-
+       reusing's build (context sensitivity itself turned out to be *on* by
+       default there -- only the depth-limiting decay is opt-in). Confirmed
+       necessary, not cosmetic: without per-context bucketing,
+       DTAINT_MAX_COND_ORDER's cutoff collapses every hit of a hot cmpid
+       into one counter regardless of which call path reached it, which
+       silently truncates real taint data on any input exercising that site
+       from more than one context (see dtaint.h's comment on
+       DTAINT_MAX_COND_ORDER for the empirical before/after).
      - `cmpid` is a per-build monotonic counter, not Angora's location-hash
        -- deterministic per build, not stable across recompiles.
      - ABI-list call-site interception covers a documented subset of libc
@@ -171,11 +182,26 @@ class AFLDTaint : public PassInfoMixin<AFLDTaint> {
   };
 
   bool instrumentFunction(Module &M, Function &F, const DataLayout &DL,
-                          LLVMContext &C, const Hooks &H, uint32_t &cmpid);
+                          LLVMContext &C, const Hooks &H, uint32_t &cmpid,
+                          uint32_t &ctxid, GlobalVariable *DtaintContext,
+                          GlobalVariable *DtaintCallSite);
 
   void instrumentCallSites(Module &M, LLVMContext &C,
                            const std::vector<CallInst *> &Calls,
                            uint32_t &cmpid);
+
+  /* Every direct call to a defined-or-declared function gets a store of a
+     per-call-site id into DtaintCallSite right before it executes -- the
+     callee's own entry instrumentation (see instrumentFunction) picks that
+     id up and XORs it into DtaintContext. Deliberately not gated by
+     kCallRules (that table is only the taint ABI-list) or by whether the
+     callee is a declaration (an extern/uninstrumented callee still pushes
+     a context frame for whatever it calls internally that we can't see,
+     same as Angora's processCall, which isn't ABI-list-gated either). */
+  void instrumentContextCallSites(LLVMContext &C,
+                                  const std::vector<CallInst *> &Calls,
+                                  uint32_t &ctxid,
+                                  GlobalVariable *DtaintCallSite);
 
 };
 
@@ -232,7 +258,10 @@ static bool binopIsSigned(BinaryOperator *BO) {
 
 bool AFLDTaint::instrumentFunction(Module &M, Function &F,
                                    const DataLayout &DL, LLVMContext &C,
-                                   const Hooks &H, uint32_t &cmpid) {
+                                   const Hooks &H, uint32_t &cmpid,
+                                   uint32_t &ctxid,
+                                   GlobalVariable *DtaintContext,
+                                   GlobalVariable *DtaintCallSite) {
 
   if (F.isDeclaration()) return false;
 
@@ -240,13 +269,45 @@ bool AFLDTaint::instrumentFunction(Module &M, Function &F,
   IntegerType *Int32Ty = IntegerType::getInt32Ty(C);
   IntegerType *Int64Ty = IntegerType::getInt64Ty(C);
   Constant    *ZeroLabel = ConstantInt::get(Int32Ty, 0);
-  Constant    *ZeroCtx = ConstantInt::get(Int32Ty, 0); /* context: always 0 */
 
 #if LLVM_MAJOR >= 20
   PointerType *PtrTy = PointerType::getUnqual(C);
 #else
   PointerType *PtrTy = PointerType::get(Int8Ty, 0);
 #endif
+
+  /* Context push/pop is unconditional for *every* defined function --
+     unlike the label-propagation instrumentation below (gated on the
+     function actually containing a tracked Load/Store/ICmp/etc.), context
+     has to thread through the whole call graph or the XOR chain breaks the
+     moment it passes through an untouched function. Mirrors AngoraPass.cc's
+     addFnWrap, without the opt-in num_fn_ctx depth-decay shift (see this
+     file's header comment on why full, undecayed depth is the right
+     default here). */
+  {
+
+    BasicBlock  &Entry = F.getEntryBlock();
+    Instruction *InsertPt = &*Entry.getFirstInsertionPt();
+    IRBuilder<>  EntryBuilder(InsertPt);
+
+    Value *OriCtx = EntryBuilder.CreateLoad(Int32Ty, DtaintContext);
+    Value *CallSiteVal = EntryBuilder.CreateLoad(Int32Ty, DtaintCallSite);
+    Value *NewCtx = EntryBuilder.CreateXor(OriCtx, CallSiteVal);
+    EntryBuilder.CreateStore(NewCtx, DtaintContext);
+
+    for (BasicBlock &BB : F) {
+
+      Instruction *Term = BB.getTerminator();
+      if (isa<ReturnInst>(Term) || isa<ResumeInst>(Term)) {
+
+        IRBuilder<> ExitBuilder(Term);
+        ExitBuilder.CreateStore(OriCtx, DtaintContext);
+
+      }
+
+    }
+
+  }
 
   /* Per-function Value -> label map. Only ever grows via instructions
      collected below, in a single forward walk over the function's
@@ -266,6 +327,7 @@ bool AFLDTaint::instrumentFunction(Module &M, Function &F,
   std::vector<SwitchInst *>     switches;
   std::vector<CallInst *>       calls;
   std::vector<MemTransferInst *> memxfers;
+  std::vector<CallInst *>       ctxCalls;
 
   for (Instruction &I : instructions(F)) {
 
@@ -318,16 +380,37 @@ bool AFLDTaint::instrumentFunction(Module &M, Function &F,
 
     } else if (auto *CB = dyn_cast<CallInst>(&I)) {
 
-      if (Function *Callee = CB->getCalledFunction())
+      if (Function *Callee = CB->getCalledFunction()) {
+
         if (findCallRule(Callee->getName())) calls.push_back(CB);
+
+        /* Direct calls only -- an indirect call's target isn't known until
+           runtime, so there's no single per-call-site id that would be
+           meaningful the way there is for a direct call (Angora's own
+           getRandomContextId() is likewise assigned to the static call
+           site, not the runtime target). Missing indirect-call frames make
+           context slightly less precise but never wrong: XOR is still
+           self-cancelling on return, it just means an indirect call
+           contributes no context change of its own. */
+        if (!Callee->isIntrinsic()) ctxCalls.push_back(CB);
+
+      }
 
     }
 
   }
 
-  if (loads.empty() && stores.empty() && binops.empty() && casts.empty() &&
-      icmps.empty() && switches.empty() && calls.empty() && memxfers.empty())
-    return false;
+  bool hasTrackedInsn =
+      !(loads.empty() && stores.empty() && binops.empty() && casts.empty() &&
+        icmps.empty() && switches.empty() && calls.empty() && memxfers.empty());
+
+  if (!ctxCalls.empty())
+    instrumentContextCallSites(C, ctxCalls, ctxid, DtaintCallSite);
+
+  /* Context push/pop above already changed this function's IR
+     unconditionally; only the label-propagation instrumentation below is
+     conditional on there being anything to track. */
+  if (!hasTrackedInsn) return true;
 
   DenseSet<Instruction *> wanted;
   for (auto *I : loads) wanted.insert(I);
@@ -426,10 +509,11 @@ bool AFLDTaint::instrumentFunction(Module &M, Function &F,
       Value *Arg1 = Builder.CreateZExtOrTrunc(IC->getOperand(0), Int64Ty);
       Value *Arg2 = Builder.CreateZExtOrTrunc(IC->getOperand(1), Int64Ty);
       Value *Cond = Builder.CreateZExt(IC, Int32Ty);
+      Value *CurCtx = Builder.CreateLoad(Int32Ty, DtaintContext);
 
       Builder.CreateCall(
           H.TraceCmp,
-          {ConstantInt::get(Int32Ty, cmpid++), ZeroCtx,
+          {ConstantInt::get(Int32Ty, cmpid++), CurCtx,
            ConstantInt::get(Int32Ty, predicate),
            ConstantInt::get(Int32Ty, bits), Arg1, Arg2, Cond,
            L1 ? L1 : ZeroLabel, L2 ? L2 : ZeroLabel});
@@ -455,10 +539,11 @@ bool AFLDTaint::instrumentFunction(Module &M, Function &F,
                                          GlobalValue::PrivateLinkage, ArrConst,
                                          "dtaint.switch.cases");
       Value *ArrPtr = Builder.CreateBitOrPointerCast(GV, PtrTy);
+      Value *CurCtx = Builder.CreateLoad(Int32Ty, DtaintContext);
 
       Builder.CreateCall(
           H.TraceSwitch,
-          {ConstantInt::get(Int32Ty, cmpid++), ZeroCtx,
+          {ConstantInt::get(Int32Ty, cmpid++), CurCtx,
            ConstantInt::get(Int32Ty, bits), MatchedVal,
            ConstantInt::get(Int32Ty, (uint32_t)CaseVals.size()), ArrPtr,
            CondLabel});
@@ -479,6 +564,27 @@ bool AFLDTaint::instrumentFunction(Module &M, Function &F,
   if (!calls.empty()) instrumentCallSites(M, C, calls, cmpid);
 
   return true;
+
+}
+
+void AFLDTaint::instrumentContextCallSites(LLVMContext &C,
+                                           const std::vector<CallInst *> &Calls,
+                                           uint32_t &ctxid,
+                                           GlobalVariable *DtaintCallSite) {
+
+  IntegerType *Int32Ty = IntegerType::getInt32Ty(C);
+
+  for (CallInst *CB : Calls) {
+
+    /* Constructing IRBuilder from an Instruction* inserts new instructions
+       immediately before it -- this runs before instrumentCallSites (see
+       instrumentFunction), so for a call that instrumentCallSites later
+       erases and replaces (the CmpFn case), this store ends up correctly
+       ordered before *that* replacement call too, not just the original. */
+    IRBuilder<> Builder(CB);
+    Builder.CreateStore(ConstantInt::get(Int32Ty, ctxid++), DtaintCallSite);
+
+  }
 
 }
 
@@ -584,16 +690,44 @@ PreservedAnalyses AFLDTaint::run(Module &M, ModuleAnalysisManager &MAM) {
   H.PropagateMem = M.getOrInsertFunction(
       "__dtaint_propagate_mem", VoidTy, PtrTy, PtrTy, Int64Ty);
 
+  /* Call-context tracking globals -- mirrors AngoraPass.cc's AngoraContext/
+     AngoraCallSite. DtaintContext is the "current call-stack context" XORed
+     at every function entry and restored at every return (see
+     instrumentFunction). DtaintCallSite is how the caller side hands the
+     callee its per-call-site id: instrumentContextCallSites stores into it
+     right before each call, and the callee's own entry code (which runs
+     immediately after, before anything else in that call) reads it back.
+     Neither needs cross-thread synchronization for this fuzzing harness
+     (one instrumented process per execution, no concurrent taint-tracked
+     threads), so plain globals, not TLS -- same as Angora's own.
+
+     CommonLinkage, not External -- this pass runs once per translation
+     unit, so every .c/.cc file in a multi-TU target (most unibench targets)
+     gets its own `new GlobalVariable(..., "__dtaint_context")`. External
+     linkage would make that a duplicate-symbol link error the moment a
+     target has more than one source file; common linkage is the "tentative
+     definition" semantics that lets the linker merge them into one, which
+     is exactly why Angora's own AngoraContext/AngoraCallSite (AngoraPass.cc)
+     use it instead of External. */
+  auto *DtaintContext = new GlobalVariable(
+      M, Int32Ty, /*isConstant=*/false, GlobalValue::CommonLinkage,
+      ConstantInt::get(Int32Ty, 0), "__dtaint_context");
+  auto *DtaintCallSite = new GlobalVariable(
+      M, Int32Ty, /*isConstant=*/false, GlobalValue::CommonLinkage,
+      ConstantInt::get(Int32Ty, 0), "__dtaint_callsite");
+
   if (getenv("AFL_QUIET") == NULL)
     printf("Running afl-llvm-dtaint-pass (Angora-parity taint tracking)\n");
 
   uint32_t cmpid = 1;
+  uint32_t ctxid = 1;
   bool     changed = false;
 
   for (Function &F : M) {
 
     if (F.isDeclaration()) continue;
-    changed |= instrumentFunction(M, F, DL, C, H, cmpid);
+    changed |= instrumentFunction(M, F, DL, C, H, cmpid, ctxid, DtaintContext,
+                                  DtaintCallSite);
 
   }
 

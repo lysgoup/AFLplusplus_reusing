@@ -85,16 +85,51 @@ extern "C" {
 #define DTAINT_COND_DONE_ST  2U
 
 /* Repeated-hit-of-the-same-site cutoff per execution (loops) -- mirrors
-   common/src/config.rs's MAX_COND_ORDER. */
+   common/src/config.rs's MAX_COND_ORDER, but context is hardcoded to 0 in
+   this port (see dtaint_cond_record's comment below), so unlike Angora --
+   where the order_map key is (cmpid, context) and a call-site-varying
+   context naturally buckets a hot site into several independent 16-deep
+   counters -- every hit of a given cmpid here shares ONE counter no matter
+   how many different call contexts it's actually reached from.
+
+   Tried raising this to 1024 as a blunt workaround (no context bucketing
+   added) and it backfired: on inputs where Angora's context genuinely does
+   vary across a hot site (e.g. jq's \\uXXXX-unescape loop touching several
+   call contexts), the higher cap did let this port catch up to Angora's
+   effectively-larger multi-context budget. But most hot loops run under a
+   *single* context throughout (tight scanning loops, havoc-mutated
+   repeated-byte inputs), where Angora's own order<=16 gate caps it at 16
+   too -- there raising the cap made this port sweep hundreds to thousands
+   of extra bytes Angora never tainted, e.g. infotocap inputs going from
+   ~20 tainted bytes to ~1950 (nearly the whole file). Measured net effect
+   across the 5-target comparison harness (dtaint_convert/src/bin/
+   compare_taint.rs in Reusing_mut's compare_with_aflpp branch): mean
+   Jaccard agreement with Angora's taint sets dropped from 0.92 to 0.49.
+   Since then: context is no longer hardcoded to 0 -- the LLVM pass
+   (instrumentation/afl-llvm-dtaint-pass.so.cc) now computes a real per-call
+   context mirroring Angora's own AngoraPass.cc (XOR of per-call-site ids
+   across the call stack, pushed at function entry / popped at return), and
+   dtaint_runtime/dtaint_logger.c's order_map keys on (cmpid, context)
+   instead of cmpid alone. 16 is kept as the per-(cmpid,context) cap rather
+   than raised again -- the whole point of adding context was to get the
+   *bucketing* right so the existing cap behaves the way Angora's does, not
+   to justify a different cap value. Still pending: this is a lower bound on
+   accuracy (matches Angora's own approximation, doesn't exceed it) --
+   deliberately taking the cap higher than 16 *within* a context bucket,
+   now that buckets are meaningful, is the next step for going past parity
+   with Angora rather than just reaching it. */
 #define DTAINT_MAX_COND_ORDER 16U
 
 /* One entry of the "cond_list" -- mirrors angora_common::cond_stmt_base::
-   CondStmtBase field-for-field (context is always 0 in this port: function-
-   call context-sensitivity is an opt-in Angora feature, off by default,
-   deferred here -- see README). lb1/lb2 are TagSet label ids, resolved to
-   byte-offset ranges separately in the "tags" table below (not inlined per
-   record), exactly mirroring how Angora's own LogData separates
-   `cond_list: Vec<CondStmtBase>` from `tags: HashMap<u32, Vec<TagSeg>>`. */
+   CondStmtBase field-for-field. context is a real per-call-stack value now
+   (see DTAINT_MAX_COND_ORDER's comment above and the LLVM pass), computed
+   the same way Angora's own AngoraPass.cc does it -- not the location-hash
+   `cmpid` is (see below), a genuinely different value that changes with
+   which call path reached this site, not just where the site is. lb1/lb2
+   are TagSet label ids, resolved to byte-offset ranges separately in the
+   "tags" table below (not inlined per record), exactly mirroring how
+   Angora's own LogData separates `cond_list: Vec<CondStmtBase>` from
+   `tags: HashMap<u32, Vec<TagSeg>>`. */
 struct dtaint_cond_record {
 
   u32 cmpid;

@@ -213,20 +213,43 @@ static void order_map_grow(void) {
 
 }
 
-/* Returns a pointer to the (possibly newly-zeroed) counter slot for
-   `cmpid`, growing/rehashing first if the table is more than half full. */
-static u32 *order_map_get(u32 cmpid) {
+/* Combines (cmpid, context) into the single u32 key order_keys[] is indexed
+   by. Angora's own order_map is keyed by the real tuple (a Rust
+   HashMap<(u32,u32),u32>, see runtime/src/logger.rs), which is exactly why
+   a hot cmpid reached from several call contexts gets several independent
+   MAX_COND_ORDER-deep counters there instead of sharing one -- see
+   DTAINT_MAX_COND_ORDER's comment in dtaint.h for the full story (and the
+   1024-cap experiment that tried to compensate for this port lacking that
+   multiplexing by just raising the single counter's ceiling, which made
+   things worse, not better). Now that __dtaint_context is a real per-call
+   value instead of the constant 0, this mixes it into the key so the same
+   (cmpid, context) collision-space Angora gets falls out here too. Plain
+   XOR of the two raw fields would collide easily (e.g. two sites differing
+   only in which of two contexts hit first), so context is run through a
+   multiplicative hash (Knuth's 32-bit constant) before mixing -- no
+   collision-freedom guarantee (32+32 bits can't fit losslessly into 32),
+   but same rigor already accepted for cmpid itself elsewhere in this file's
+   comments. */
+static inline u32 order_map_key(u32 cmpid, u32 context) {
+
+  return cmpid ^ (context * 2654435761U);
+
+}
+
+/* Returns a pointer to the (possibly newly-zeroed) counter slot for `key`,
+   growing/rehashing first if the table is more than half full. */
+static u32 *order_map_get(u32 key) {
 
   if (order_cap == 0 || order_len * 2 >= order_cap) order_map_grow();
 
-  u32 idx = cmpid % order_cap;
+  u32 idx = key % order_cap;
 
-  while (order_keys[idx] != ORDER_MAP_EMPTY && order_keys[idx] != cmpid)
+  while (order_keys[idx] != ORDER_MAP_EMPTY && order_keys[idx] != key)
     idx = (idx + 1) % order_cap;
 
   if (order_keys[idx] == ORDER_MAP_EMPTY) {
 
-    order_keys[idx] = cmpid;
+    order_keys[idx] = key;
     order_vals[idx] = 0;
     order_len++;
 
@@ -238,7 +261,7 @@ static u32 *order_map_get(u32 cmpid) {
 
 static u32 get_order(struct dtaint_cond_record *cond) {
 
-  u32 *order = order_map_get(cond->cmpid);
+  u32 *order = order_map_get(order_map_key(cond->cmpid, cond->context));
 
   if (cond->order == 0) *order = *order + 1;
   cond->order += *order;
