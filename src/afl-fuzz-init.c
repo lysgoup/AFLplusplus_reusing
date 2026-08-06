@@ -1426,7 +1426,13 @@ void perform_dry_run(afl_state_t *afl) {
        do_if_has_new()/try_unlimited_memory. */
     if (unlikely(afl->dtaint_binary) && !q->disabled) {
 
-      log_dtaint_for_new_input(afl, use_mem, read_len, q->fname);
+      u8 *dtaint_path = log_dtaint_for_new_input(afl, use_mem, read_len, q->fname);
+
+      /* Initial seeds have no parent (q->mother is NULL at this point --
+         pivot_inputs() runs before afl->queue_cur is ever set). */
+      reusing_ingest_dtaint(afl, dtaint_path, use_mem, read_len, NULL, 0);
+
+      if (dtaint_path) { ck_free(dtaint_path); }
 
     }
 

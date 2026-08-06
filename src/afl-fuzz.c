@@ -31,6 +31,7 @@
 #include "alloc-inl.h"
 #include "cmplog.h"
 #include "dtaint.h"
+#include "reusing_pool.h"
 #include <sys/stat.h>
 #include <errno.h>
 #include "asanfuzz.h"
@@ -3035,6 +3036,13 @@ void afl_alloc_shared_memory(afl_state_t *afl) {
 
     OKF("Dtaint forkserver successfully started");
 
+    /* Only ever created here, gated on dtaint mode actually being on --
+       with no dtaint tracking there's no taint data to ever pull a reuse
+       candidate out of, so an ungated pool would just sit there empty
+       for the whole campaign. */
+    afl->reusing_pool = reusing_pool_create();
+    afl->reusing_filter = reusing_filter_select();
+
   }
 
   load_auto(afl);
@@ -3776,6 +3784,7 @@ void stop_fuzzing(afl_state_t *afl) {
   if (afl->cmplog_binary) { afl_fsrv_deinit(&afl->cmplog_fsrv); }
 
   if (afl->dtaint_binary) { afl_fsrv_deinit(&afl->dtaint_fsrv); }
+  if (afl->reusing_pool) { reusing_pool_free(afl->reusing_pool); }
 
   /* remove tmpfile */
   if (!afl->in_place_resume && afl->fsrv.out_file) {

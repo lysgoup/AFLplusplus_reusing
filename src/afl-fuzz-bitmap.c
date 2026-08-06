@@ -809,7 +809,21 @@ u8 __attribute__((hot)) save_if_interesting(afl_state_t *afl, void *mem,
        instrumentation/README.dtaint.md's "Known gaps". */
     if (unlikely(afl->dtaint_binary)) {
 
-      log_dtaint_for_new_input(afl, mem, len, queue_fn);
+      u8 *dtaint_path = log_dtaint_for_new_input(afl, mem, len, queue_fn);
+
+      u8 *parent_buf = NULL;
+      u32 parent_len = 0;
+
+      if (afl->queue_cur) {
+
+        parent_buf = queue_testcase_get(afl, afl->queue_cur);
+        parent_len = afl->queue_cur->len;
+
+      }
+
+      reusing_ingest_dtaint(afl, dtaint_path, mem, len, parent_buf, parent_len);
+
+      if (dtaint_path) { ck_free(dtaint_path); }
 
     }
 

@@ -52,6 +52,7 @@
 #include "common.h"
 
 #include "afl-ijon-min.h"
+#include "reusing_filter.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -613,6 +614,11 @@ struct foreign_sync {
 
 };
 
+/* Full definition in include/reusing_pool.h -- only the .c files that
+   actually call reusing_pool_*() include that header; this is enough for
+   afl_state_t below to hold a pointer to one. */
+struct reusing_pool;
+
 typedef struct afl_state {
 
   /* Position of this state in the global states list */
@@ -847,6 +853,23 @@ typedef struct afl_state {
      inspected, nothing reads the result back into mutation strategy yet. */
   char            *dtaint_binary;
   afl_forkserver_t dtaint_fsrv;     /* dtaint has its own little forkserver */
+
+  /* Reuse-candidate pool (include/reusing_pool.h) -- only ever non-NULL
+     when afl->dtaint_binary is set (see afl-fuzz.c, initialized right
+     alongside the dtaint forkserver itself: no dtaint tracking means no
+     taint data to ever extract a candidate from in the first place).
+     Forward-declared, not `#include "reusing_pool.h"` here, since
+     afl-fuzz.h is pulled in practically everywhere and only the handful
+     of .c files that actually populate/consume the pool need its real
+     definition. */
+  struct reusing_pool *reusing_pool;
+
+  /* Chosen once at startup (see reusing_filter_select(), called right
+     alongside reusing_pool's own creation above -- same afl->dtaint_binary
+     gate, same reasoning) and reused for every candidate afterward rather
+     than re-resolving AFL_REUSING_VALUE_FILTER per call. NULL whenever
+     reusing_pool is NULL. */
+  reusing_filter_fn reusing_filter;
 
   /* ASAN Fuzing */
   char            *san_binary[MAX_EXTRA_SAN_BINARY];
@@ -1495,10 +1518,32 @@ u8 run_one_dtaint(afl_state_t *afl, u8 *out_buf, u32 len);
 /* Triggers a taint-tracking run for a newly-discovered queue entry and
    leaves its track file under <out_dir>/dtaint_logs/ -- called from
    save_if_interesting() right after add_to_queue(), gated on
-   afl->dtaint_binary (i.e. AFL_DTAINT_BINARY) being set. Nothing reads the
-   resulting file back yet -- see the README's "Known gaps". */
-void log_dtaint_for_new_input(afl_state_t *afl, u8 *mem, u32 len,
-                              u8 *queue_fname);
+   afl->dtaint_binary (i.e. AFL_DTAINT_BINARY) being set. Returns the
+   ck_alloc'd dest path (caller ck_free()s it) on success, or NULL if the
+   target had nothing taint-worthy to report (routine -- see
+   log_dtaint_for_new_input's own comment) or the rename failed. Passing
+   that path straight to reusing_ingest_dtaint() below is the intended use
+   -- keeps the path-naming convention in this one place instead of
+   duplicating it at every call site. */
+u8 *log_dtaint_for_new_input(afl_state_t *afl, u8 *mem, u32 len,
+                             u8 *queue_fname);
+
+/* Parses the .dtaint file at `dtaint_path` (may be NULL -- a no-op, see
+   log_dtaint_for_new_input's return contract above) and, for every
+   cond_list entry with BOTH lb1 and lb2 tainted, runs it through
+   afl->reusing_filter and pools the survivors under include/
+   reusing_pool.h -- once for lb1's own segments, once for lb2's own
+   segments, and once for the two merged, so a later consumer can reuse
+   either half independently or the pair together. Single-tainted entries
+   (one side a compile-time constant) are read but not pooled yet --
+   deferred, see src/afl-fuzz-reusing-ingest.c's own comment. `child_buf`/
+   `child_len` must be the exact bytes just run through the dtaint binary
+   (dtaint's byte offsets are only meaningful against that same run);
+   `parent_buf`/`parent_len` may be NULL/0 (no parent, e.g. an original -i
+   seed) and are forwarded to the filter as-is. */
+void reusing_ingest_dtaint(afl_state_t *afl, const u8 *dtaint_path,
+                           const u8 *child_buf, u32 child_len,
+                           const u8 *parent_buf, u32 parent_len);
 
 /* RedQueen */
 u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len);

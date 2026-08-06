@@ -76,13 +76,15 @@ u8 run_one_dtaint(afl_state_t *afl, u8 *out_buf, u32 len) {
    is created. Runs the input through run_one_dtaint(), then renames
    whatever landed at the fixed scratch path to a per-input destination
    under <out_dir>/dtaint_logs/ named after the queue entry -- that
-   renamed file *is* the log this phase was asked to produce; nothing
-   parses it back yet. If the scratch file doesn't exist afterward, the
-   target simply had nothing taint-worthy to report for this input
-   (dtaint_logger_fini() skips writing when its cond_list is empty) --
-   not an error. */
-void log_dtaint_for_new_input(afl_state_t *afl, u8 *mem, u32 len,
-                              u8 *queue_fname) {
+   renamed file *is* the log this phase was asked to produce. Returns the
+   ck_alloc'd dest path (caller ck_free()s it) so reusing_ingest_dtaint()
+   (src/afl-fuzz-reusing-ingest.c) can parse it back, or NULL if the
+   scratch file doesn't exist afterward -- the target simply had nothing
+   taint-worthy to report for this input (dtaint_logger_fini() skips
+   writing when its cond_list is empty), not an error -- or if the rename
+   itself failed. */
+u8 *log_dtaint_for_new_input(afl_state_t *afl, u8 *mem, u32 len,
+                             u8 *queue_fname) {
 
   run_one_dtaint(afl, mem, len);
 
@@ -92,7 +94,7 @@ void log_dtaint_for_new_input(afl_state_t *afl, u8 *mem, u32 len,
   if (access((char *)scratch_path, F_OK) != 0) {
 
     ck_free(scratch_path);
-    return;
+    return NULL;
 
   }
 
@@ -104,10 +106,13 @@ void log_dtaint_for_new_input(afl_state_t *afl, u8 *mem, u32 len,
   if (rename((char *)scratch_path, (char *)dest_path)) {
 
     WARNF("Could not rename dtaint scratch file to '%s'", dest_path);
+    ck_free(dest_path);
+    ck_free(scratch_path);
+    return NULL;
 
   }
 
-  ck_free(dest_path);
   ck_free(scratch_path);
+  return dest_path;
 
 }
