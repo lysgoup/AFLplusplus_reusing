@@ -14,6 +14,7 @@
 
  */
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -256,5 +257,60 @@ reusing_record_t *reusing_pool_insert(reusing_pool_t          *pool,
   }
 
   return rec;
+
+}
+
+static const char *source_name(reusing_value_source_t source) {
+
+  switch (source) {
+
+    case REUSING_SRC_TAINTED: return "TAINTED";
+    case REUSING_SRC_MAGIC: return "MAGIC";
+    case REUSING_SRC_CMPFN: return "CMPFN";
+
+  }
+
+  return "?";
+
+}
+
+void reusing_pool_dump(const reusing_pool_t *pool, const char *path) {
+
+  if (!pool) { return; }
+
+  FILE *fp = fopen(path, "w");
+  if (!fp) { return; }
+
+  fprintf(fp, "# reusing pool dump: %u distinct pattern(s)\n", pool->len);
+
+  for (u32 i = 0; i < pool->cap; i++) {
+
+    reusing_bucket_t *bucket = pool->slots[i];
+    if (!bucket) { continue; }
+
+    fprintf(fp, "pattern [");
+    for (u32 j = 0; j < bucket->pattern.n_lens; j++) {
+
+      fprintf(fp, "%s%u", j ? "," : "", bucket->pattern.lens[j]);
+
+    }
+
+    fprintf(fp, "] (%u record(s)):\n", bucket->n_records);
+
+    for (u32 j = 0; j < bucket->n_records; j++) {
+
+      reusing_record_t *r = &bucket->records[j];
+      fprintf(fp, "  cmpid=%u context=%u source=%s value=", r->cmpid, r->context,
+             source_name(r->source));
+
+      for (u32 k = 0; k < r->value_len; k++) fprintf(fp, "%02x", r->value[k]);
+
+      fprintf(fp, " (len=%u)\n", r->value_len);
+
+    }
+
+  }
+
+  fclose(fp);
 
 }

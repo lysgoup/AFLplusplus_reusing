@@ -3784,7 +3784,21 @@ void stop_fuzzing(afl_state_t *afl) {
   if (afl->cmplog_binary) { afl_fsrv_deinit(&afl->cmplog_fsrv); }
 
   if (afl->dtaint_binary) { afl_fsrv_deinit(&afl->dtaint_fsrv); }
-  if (afl->reusing_pool) { reusing_pool_free(afl->reusing_pool); }
+
+  if (afl->reusing_pool) {
+
+    /* Human-eyeball sanity check, not a data format anything reads back --
+       see include/reusing_pool.h's reusing_pool_dump(). Written before
+       free() so there's something to look at whether this run ended
+       normally or via Ctrl+C (both paths fall through to this same
+       cleanup code, afl-fuzz.c has no separate SIGINT-exit shortcut). */
+    u8 *dump_path = alloc_printf("%s/reusing_pool.txt", afl->out_dir);
+    reusing_pool_dump(afl->reusing_pool, (const char *)dump_path);
+    ck_free(dump_path);
+
+    reusing_pool_free(afl->reusing_pool);
+
+  }
 
   /* remove tmpfile */
   if (!afl->in_place_resume && afl->fsrv.out_file) {

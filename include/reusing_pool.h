@@ -135,6 +135,14 @@ reusing_record_t *reusing_pool_insert(reusing_pool_t          *pool,
                                       reusing_value_source_t source,
                                       const u8 *value, u32 value_len);
 
+/* Writes every bucket's pattern and every record in it (cmpid, context,
+   source, hex-encoded value) to `path` as plain text -- meant purely for
+   a human to eyeball after a run (e.g. at shutdown, see afl-fuzz.c's
+   cleanup path) to sanity-check what actually ended up pooled, not for
+   any code to read back. Silently does nothing if `pool` is NULL or
+   `path` can't be opened for writing. */
+void reusing_pool_dump(const reusing_pool_t *pool, const char *path);
+
 #ifdef __cplusplus
 }
 #endif

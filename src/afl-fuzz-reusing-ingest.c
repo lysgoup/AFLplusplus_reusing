@@ -4,26 +4,28 @@
 
    The glue between the other reusing_* pieces and the fuzzing loop:
    loads a just-written .dtaint file (include/reusing_dtaint_reader.h),
-   walks its cond_list, and for every comparison where BOTH operands trace
-   back to real input bytes (cond->lb1 and cond->lb2 both nonzero), pools
-   up to three reuse candidates through afl->reusing_filter and
+   walks its cond_list, and for every taint-derived side of a comparison
+   pools a reuse candidate through afl->reusing_filter and
    afl->reusing_pool:
 
-     - lb1's own segments alone
-     - lb2's own segments alone
-     - lb1's and lb2's segments merged into one
+     - if lb1 is tainted, lb1's own segments alone
+     - if lb2 is tainted, lb2's own segments alone
+     - if BOTH are tainted, additionally lb1's and lb2's segments merged
+       into one
 
-   so a later consumer can reuse either side independently or the
-   observed pair together. Each candidate's pattern is computed fresh via
-   reusing_compute_pattern() (include/reusing_pattern.h) from exactly the
-   segments passed to it -- lb1 alone, lb2 alone, or both concatenated --
-   since the pattern depends on which segments went in.
+   so a later consumer can reuse either side independently or (when both
+   sides trace back to real input bytes) the observed pair together. Each
+   candidate's pattern is computed fresh via reusing_compute_pattern()
+   (include/reusing_pattern.h) from exactly the segments passed to it --
+   lb1 alone, lb2 alone, or both concatenated -- since the pattern depends
+   on which segments went in.
 
-   cond_list entries with only ONE side tainted (comparing input bytes
-   against a compile-time constant -- REUSING_SRC_MAGIC/REUSING_SRC_CMPFN
-   in include/reusing_pool.h's enum) are read but deliberately not pooled
-   here yet -- deferred by explicit request, not an oversight. Every
-   candidate this file does insert is REUSING_SRC_TAINTED.
+   The untainted side of a single-tainted comparison (a compile-time
+   constant -- REUSING_SRC_MAGIC/REUSING_SRC_CMPFN in include/
+   reusing_pool.h's enum) is deliberately not pooled here -- deferred by
+   explicit request, not an oversight. Every candidate this file does
+   insert is REUSING_SRC_TAINTED: real bytes sliced out of child_buf at a
+   tainted side's own offsets, never the constant itself.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -144,35 +146,33 @@ void reusing_ingest_dtaint(afl_state_t *afl, const u8 *dtaint_path,
 
     const struct dtaint_cond_record *cond = &conds[i];
 
-    /* Single-tainted (comparison against a compile-time constant) --
-       deferred, see this file's own header comment. */
-    if (cond->lb1 == 0 || cond->lb2 == 0) continue;
-
+    /* dtaint_reader_resolve_label() itself already returns NULL (and
+       n=0) for DTAINT_NO_LABEL (0), so an untainted side and a
+       (shouldn't-happen-but-defend-anyway) missing tags-table entry both
+       fall out here the same way -- no separate cond->lb1/lb2 == 0 check
+       needed. */
     u32 n1 = 0, n2 = 0;
     const struct dtaint_tag_seg_wire *segs1 =
         dtaint_reader_resolve_label(reader, cond->lb1, &n1);
     const struct dtaint_tag_seg_wire *segs2 =
         dtaint_reader_resolve_label(reader, cond->lb2, &n2);
 
-    /* Both labels are nonzero, so the writer's tags table should have an
-       entry for each (save_tag() is called unconditionally for both
-       before the cond record itself is ever pushed) -- missing here means
-       a truncated file, which dtaint_reader_load() would normally have
-       already caught. Skip defensively rather than trust it. */
-    if (!segs1 || !segs2) continue;
+    if (segs1) ingest_segs(afl, cond, segs1, n1, child_buf, child_len, parent_buf, parent_len);
+    if (segs2) ingest_segs(afl, cond, segs2, n2, child_buf, child_len, parent_buf, parent_len);
 
-    ingest_segs(afl, cond, segs1, n1, child_buf, child_len, parent_buf, parent_len);
-    ingest_segs(afl, cond, segs2, n2, child_buf, child_len, parent_buf, parent_len);
+    if (segs1 && segs2) {
 
-    struct dtaint_tag_seg_wire *combined =
-        malloc((size_t)(n1 + n2) * sizeof(struct dtaint_tag_seg_wire));
-    if (!combined) abort();
-    memcpy(combined, segs1, (size_t)n1 * sizeof(struct dtaint_tag_seg_wire));
-    memcpy(combined + n1, segs2, (size_t)n2 * sizeof(struct dtaint_tag_seg_wire));
+      struct dtaint_tag_seg_wire *combined =
+          malloc((size_t)(n1 + n2) * sizeof(struct dtaint_tag_seg_wire));
+      if (!combined) abort();
+      memcpy(combined, segs1, (size_t)n1 * sizeof(struct dtaint_tag_seg_wire));
+      memcpy(combined + n1, segs2, (size_t)n2 * sizeof(struct dtaint_tag_seg_wire));
 
-    ingest_segs(afl, cond, combined, n1 + n2, child_buf, child_len, parent_buf, parent_len);
+      ingest_segs(afl, cond, combined, n1 + n2, child_buf, child_len, parent_buf, parent_len);
 
-    free(combined);
+      free(combined);
+
+    }
 
   }
 
