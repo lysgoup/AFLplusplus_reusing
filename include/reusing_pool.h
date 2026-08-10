@@ -108,6 +108,12 @@ typedef struct reusing_pool {
 reusing_pool_t *reusing_pool_create(void);
 void            reusing_pool_free(reusing_pool_t *pool);
 
+/* Pure lookup -- NULL if no bucket exists for `pattern` yet. Never
+   creates or mutates the pool, so read-only callers (e.g. a mutation
+   stage) can use it directly. */
+reusing_bucket_t *reusing_pool_find_bucket(reusing_pool_t           *pool,
+                                           const reusing_pattern_t *pattern);
+
 /* Finds or creates the bucket for `pattern` (matched by real equality,
    not just hash -- see reusing_bucket_t's own comment on why). The
    returned bucket is pool-owned; callers don't free it directly. */

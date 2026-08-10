@@ -403,6 +403,7 @@ enum {
   STAGE_ITS,
   STAGE_INF,
   STAGE_QUICK,
+  STAGE_REUSING,
   STAGE_MAX
 
 };
@@ -618,6 +619,7 @@ struct foreign_sync {
    actually call reusing_pool_*() include that header; this is enough for
    afl_state_t below to hold a pointer to one. */
 struct reusing_pool;
+struct reusing_seen;
 
 typedef struct afl_state {
 
@@ -870,6 +872,11 @@ typedef struct afl_state {
      than re-resolving AFL_REUSING_VALUE_FILTER per call. NULL whenever
      reusing_pool is NULL. */
   reusing_filter_fn reusing_filter;
+
+  /* Campaign-wide (cmpid, condition) novelty set (include/reusing_seen.h)
+     backing the "novel" filter level -- same lifecycle/gating as
+     reusing_pool above. */
+  struct reusing_seen *reusing_seen;
 
   /* ASAN Fuzing */
   char            *san_binary[MAX_EXTRA_SAN_BINARY];
@@ -1544,6 +1551,12 @@ u8 *log_dtaint_for_new_input(afl_state_t *afl, u8 *mem, u32 len,
 void reusing_ingest_dtaint(afl_state_t *afl, const u8 *dtaint_path,
                            const u8 *child_buf, u32 child_len,
                            const u8 *parent_buf, u32 parent_len);
+
+/* Basic skeleton only -- see src/afl-fuzz-reusing-mutate.c's own comment
+   for what's wired up vs. still a placeholder. Called from fuzz_one()
+   right next to input_to_state_stage() below, same shape/return
+   convention (0: continue: 1: caller should goto abandon_entry). */
+u8 reusing_mutation_stage(afl_state_t *afl, u8 *in_buf, u8 *out_buf, u32 len);
 
 /* RedQueen */
 u8 input_to_state_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len);

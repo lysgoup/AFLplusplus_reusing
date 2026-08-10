@@ -65,6 +65,14 @@ typedef struct {
   const struct dtaint_tag_seg_wire *segs;
   u32                               n_segs;
 
+  /* 1 if (cond->cmpid, cond->condition) has never been seen before this
+     campaign (see include/reusing_seen.h) -- context deliberately left
+     out of that key, since context differences trace back to an
+     earlier call site's own choice, not this cmpid's. Always computed
+     (and the seen-set always updated) regardless of which filter is
+     active, so the set stays accurate even when switching filters. */
+  u8 is_novel_tuple;
+
 } reusing_filter_ctx_t;
 
 /* A struct, not a bare bool, so new signals (a confidence score, a

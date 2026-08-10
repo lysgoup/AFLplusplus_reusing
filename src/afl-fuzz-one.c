@@ -604,6 +604,15 @@ u8 fuzz_one(afl_state_t *afl) {
 
   }
 
+  /* Reuse taint-derived candidate values pooled from earlier runs (see
+     include/reusing_pool.h) at this input's own tainted comparison
+     sites -- skeleton only for now, see src/afl-fuzz-reusing-mutate.c. */
+  if (unlikely(reusing_mutation_stage(afl, in_buf, out_buf, len))) {
+
+    goto abandon_entry;
+
+  }
+
   if (unlikely(afl->shm.cmplog_mode &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {

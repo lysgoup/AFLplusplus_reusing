@@ -32,6 +32,7 @@
 #include "cmplog.h"
 #include "dtaint.h"
 #include "reusing_pool.h"
+#include "reusing_seen.h"
 #include <sys/stat.h>
 #include <errno.h>
 #include "asanfuzz.h"
@@ -3042,6 +3043,7 @@ void afl_alloc_shared_memory(afl_state_t *afl) {
        for the whole campaign. */
     afl->reusing_pool = reusing_pool_create();
     afl->reusing_filter = reusing_filter_select();
+    afl->reusing_seen = reusing_seen_create();
 
   }
 
@@ -3799,6 +3801,8 @@ void stop_fuzzing(afl_state_t *afl) {
     reusing_pool_free(afl->reusing_pool);
 
   }
+
+  if (afl->reusing_seen) { reusing_seen_free(afl->reusing_seen); }
 
   /* remove tmpfile */
   if (!afl->in_place_resume && afl->fsrv.out_file) {

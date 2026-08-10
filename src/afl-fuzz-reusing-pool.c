@@ -157,38 +157,37 @@ static void pool_grow(reusing_pool_t *pool) {
 
 }
 
-reusing_bucket_t *reusing_pool_get_bucket(reusing_pool_t           *pool,
-                                          const reusing_pattern_t *pattern) {
+reusing_bucket_t *reusing_pool_find_bucket(reusing_pool_t           *pool,
+                                           const reusing_pattern_t *pattern) {
 
-  u32 h = hash_pattern(pattern);
-  u32 idx = h % pool->cap;
+  u32 idx = hash_pattern(pattern) % pool->cap;
   u32 probed = 0;
 
   while (pool->slots[idx]) {
 
-    if (pattern_equal(&pool->slots[idx]->pattern, pattern)) {
-
-      return pool->slots[idx];
-
-    }
+    if (pattern_equal(&pool->slots[idx]->pattern, pattern)) { return pool->slots[idx]; }
 
     idx = (idx + 1) % pool->cap;
-    /* Every slot occupied and none matched -- only reachable if grow's
-       load-factor check below is broken (table is full). Guard instead
-       of looping forever. */
-    if (++probed >= pool->cap) { pool_grow(pool); idx = h % pool->cap; probed = 0; }
+    if (++probed >= pool->cap) { return NULL; } /* table always <=half full; shouldn't happen */
 
   }
+
+  return NULL;
+
+}
+
+reusing_bucket_t *reusing_pool_get_bucket(reusing_pool_t           *pool,
+                                          const reusing_pattern_t *pattern) {
+
+  reusing_bucket_t *found = reusing_pool_find_bucket(pool, pattern);
+  if (found) { return found; }
 
   /* Not found -- create. Grow first if we're more than half full, same
      threshold dtaint_logger.c's order_map uses. */
-  if (pool->len * 2 >= pool->cap) {
+  if (pool->len * 2 >= pool->cap) { pool_grow(pool); }
 
-    pool_grow(pool);
-    idx = hash_pattern(pattern) % pool->cap;
-    while (pool->slots[idx]) { idx = (idx + 1) % pool->cap; }
-
-  }
+  u32 idx = hash_pattern(pattern) % pool->cap;
+  while (pool->slots[idx]) { idx = (idx + 1) % pool->cap; }
 
   reusing_bucket_t *bucket = malloc(sizeof(reusing_bucket_t));
   if (!bucket) { abort(); }

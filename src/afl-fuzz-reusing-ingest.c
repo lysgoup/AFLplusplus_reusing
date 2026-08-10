@@ -44,6 +44,7 @@
 #include "reusing_dtaint_reader.h"
 #include "reusing_pattern.h"
 #include "reusing_pool.h"
+#include "reusing_seen.h"
 
 /* Computes the pattern for `segs`, runs it through `filter`, and -- if
    kept -- slices `child_buf` at the (merged) segment offsets and inserts
@@ -55,7 +56,8 @@
 static void ingest_segs(afl_state_t *afl, const struct dtaint_cond_record *cond,
                         const struct dtaint_tag_seg_wire *segs, u32 n_segs,
                         const u8 *child_buf, u32 child_len,
-                        const u8 *parent_buf, u32 parent_len) {
+                        const u8 *parent_buf, u32 parent_len,
+                        u8 is_novel) {
 
   if (n_segs == 0) return;
 
@@ -96,6 +98,7 @@ static void ingest_segs(afl_state_t *afl, const struct dtaint_cond_record *cond,
       .cond = cond,
       .segs = merged,
       .n_segs = n_merged,
+      .is_novel_tuple = is_novel,
 
   };
 
@@ -146,6 +149,14 @@ void reusing_ingest_dtaint(afl_state_t *afl, const u8 *dtaint_path,
 
     const struct dtaint_cond_record *cond = &conds[i];
 
+    /* Always checked (and the seen-set always updated), regardless of
+       which filter is active -- one call per cond, not per candidate
+       side, since (cmpid, condition) is a property of the comparison
+       itself, not of which side a candidate happens to be derived
+       from. See include/reusing_seen.h and reusing_filter_ctx_t's own
+       is_novel_tuple comment. */
+    u8 is_novel = reusing_seen_check_and_mark(afl->reusing_seen, cond->cmpid, cond->condition);
+
     /* dtaint_reader_resolve_label() itself already returns NULL (and
        n=0) for DTAINT_NO_LABEL (0), so an untainted side and a
        (shouldn't-happen-but-defend-anyway) missing tags-table entry both
@@ -157,8 +168,17 @@ void reusing_ingest_dtaint(afl_state_t *afl, const u8 *dtaint_path,
     const struct dtaint_tag_seg_wire *segs2 =
         dtaint_reader_resolve_label(reader, cond->lb2, &n2);
 
-    if (segs1) ingest_segs(afl, cond, segs1, n1, child_buf, child_len, parent_buf, parent_len);
-    if (segs2) ingest_segs(afl, cond, segs2, n2, child_buf, child_len, parent_buf, parent_len);
+    if (segs1) {
+
+      ingest_segs(afl, cond, segs1, n1, child_buf, child_len, parent_buf, parent_len, is_novel);
+
+    }
+
+    if (segs2) {
+
+      ingest_segs(afl, cond, segs2, n2, child_buf, child_len, parent_buf, parent_len, is_novel);
+
+    }
 
     if (segs1 && segs2) {
 
@@ -168,7 +188,8 @@ void reusing_ingest_dtaint(afl_state_t *afl, const u8 *dtaint_path,
       memcpy(combined, segs1, (size_t)n1 * sizeof(struct dtaint_tag_seg_wire));
       memcpy(combined + n1, segs2, (size_t)n2 * sizeof(struct dtaint_tag_seg_wire));
 
-      ingest_segs(afl, cond, combined, n1 + n2, child_buf, child_len, parent_buf, parent_len);
+      ingest_segs(afl, cond, combined, n1 + n2, child_buf, child_len, parent_buf, parent_len,
+                 is_novel);
 
       free(combined);
 

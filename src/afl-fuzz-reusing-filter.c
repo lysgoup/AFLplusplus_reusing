@@ -82,6 +82,21 @@ static reusing_filter_result_t filter_diff(const reusing_filter_ctx_t *ctx) {
 
 }
 
+/* Level "novel": keep only if (cond->cmpid, cond->condition) has never
+   been seen before this campaign (include/reusing_seen.h) -- checked
+   against every taint-tracked input so far, not just one parent, so
+   strictly stronger evidence than filter_diff's "byte differs from THIS
+   parent". Context is deliberately excluded from that key; see
+   reusing_filter_ctx_t's own comment on is_novel_tuple for why. The
+   check-and-mark itself always runs upstream regardless of which filter
+   is active (see afl-fuzz-reusing-ingest.c) -- this just reads the
+   result. */
+static reusing_filter_result_t filter_novel(const reusing_filter_ctx_t *ctx) {
+
+  return (reusing_filter_result_t){.keep = ctx->is_novel_tuple};
+
+}
+
 /* Matched against AFL_REUSING_VALUE_FILTER. Add a new level by writing a
    function above and one line here -- reusing_filter_select() and every
    call site stay untouched. */
@@ -91,17 +106,10 @@ static const reusing_filter_entry_t kFilters[] = {
      "keep every taint-derived candidate, no extra filtering"},
     {"diff", filter_diff,
      "keep only candidates overlapping a byte range that differs from the "
-     "parent input (default)"},
-
-    /* Next planned level, "cond_flip": keep only if this cmpid's recorded
-       condition differs between the parent's own .dtaint log and this
-       one -- strictly stronger than "diff" (confirms the mutation
-       actually flipped this specific branch, not just touched bytes near
-       it), but needs a fuzzer-side .dtaint file *reader* first. Today
-       dtaint_runtime/dtaint_logger.c only has a writer, and it runs
-       inside the target process, not afl-fuzz's -- add that reader, then
-       this becomes a function here + one line, same as every other
-       level. */
+     "parent input"},
+    {"novel", filter_novel,
+     "keep only candidates whose (cmpid, condition) has never been seen "
+     "before this campaign (default)"},
 
 };
 
@@ -145,14 +153,16 @@ reusing_filter_fn reusing_filter_select(void) {
 
   }
 
-  /* Default is "diff", not "none" -- see filter_diff's own comment for
-     why plain taintedness isn't a strong enough signal by itself. */
+  /* Default is "novel" -- campaign-wide (cmpid, condition) history is a
+     stronger signal than filter_diff's "differs from one parent" (see
+     filter_novel's own comment), and plain taintedness alone ("none")
+     isn't a strong enough signal at all. */
   for (u32 i = 0; i < N_FILTERS; ++i) {
 
-    if (!strcmp("diff", kFilters[i].name)) { return kFilters[i].fn; }
+    if (!strcmp("novel", kFilters[i].name)) { return kFilters[i].fn; }
 
   }
 
-  return filter_none; /* unreachable unless kFilters loses "diff" itself */
+  return filter_none; /* unreachable unless kFilters loses "novel" itself */
 
 }
