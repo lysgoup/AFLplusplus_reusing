@@ -73,6 +73,16 @@ public:
   // Const Variables
   DenseSet<u32> UniqCidSet;
 
+  /* NOT part of the vendored-unmodified original -- see this file's own
+     comment above getInstructionId() and dfsan_legacy/README.md's
+     "What's here" section, which documents this as the file's one
+     deliberate deviation (ported from /home/yunseo/Reusing_mut/
+     llvm_mode/pass/AngoraPass.cc, a separate copy of this same pass that
+     already carried it). Writes cmpid -> source location as each cmpid
+     is assigned; see runOnModule() for where the file itself gets
+     opened/closed. */
+  std::ofstream cmpid_log_file;
+
   // Configurations
   bool gen_id_random;
   bool output_cond_loc;
@@ -114,7 +124,7 @@ public:
 
   AngoraLLVMPass() : ModulePass(ID) {}
   bool runOnModule(Module &M) override;
-  u32 getInstructionId(Instruction *Inst);
+  u32 getInstructionId(Instruction *Inst, const char *InstType);
   u32 getRandomBasicBlockId();
   bool skipBasicBlock();
   u32 getRandomNum();
@@ -165,7 +175,14 @@ u32 AngoraLLVMPass::getRandomContextId() {
 
 u32 AngoraLLVMPass::getRandomInstructionId() { return getRandomNum(); }
 
-u32 AngoraLLVMPass::getInstructionId(Instruction *Inst) {
+/* `InstType` is NOT part of the vendored-unmodified original signature --
+   see this class's own cmpid_log_file comment. A short, call-site-chosen
+   label ("ICmp", "Branch", "Switch", "CmpFn", or the opcode name for
+   visitExploitation's call sites) identifying what kind of comparison
+   this cmpid belongs to, written into cmpid_log_file alongside the
+   source location below -- purely for that log's own readability, plays
+   no role in computing `h` itself. */
+u32 AngoraLLVMPass::getInstructionId(Instruction *Inst, const char *InstType) {
   u32 h = 0;
   if (is_bc) {
     h = ++CidCounter;
@@ -197,6 +214,31 @@ u32 AngoraLLVMPass::getInstructionId(Instruction *Inst) {
              << ", Ln " << Loc->getLine() << ", Col " << Loc->getColumn()
              << "\n";
     }
+  }
+
+  /* Not part of the vendored-unmodified original -- see cmpid_log_file's
+     own comment. A fresh getDebugLoc() lookup here (rather than reusing
+     `Loc` from the is_bc/gen_id_random branch above) since that branch
+     doesn't run at all under is_bc, and even under gen_id_random takes
+     the getRandomInstructionId() path without ever binding `Loc` --
+     mirrors output_cond_loc's own independent lookup just above for the
+     same reason. */
+  if (cmpid_log_file.is_open()) {
+
+    if (DILocation *Loc = Inst->getDebugLoc()) {
+
+      std::string filename = cast<DIScope>(Loc->getScope())->getFilename().str();
+      cmpid_log_file << h << ": " << filename << ", " << Loc->getLine() << ", "
+                    << Loc->getColumn() << ", [" << InstType << "]\n";
+
+    } else {
+
+      cmpid_log_file << h << ": [no-debug-info], 0, 0, [" << InstType << "]\n";
+
+    }
+
+    cmpid_log_file.flush();
+
   }
 
   return h;
@@ -516,7 +558,7 @@ void AngoraLLVMPass::visitCompareFunc(Instruction *Inst) {
   if (!isa<CallInst>(Inst) || !ExploitList.isIn(*Inst, CompareFuncCat)) {
     return;
   }
-  ConstantInt *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst));
+  ConstantInt *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst, "CmpFn"));
 
   if (!TrackMode)
     return;
@@ -689,7 +731,7 @@ void AngoraLLVMPass::visitCmpInst(Instruction *Inst) {
   Instruction *InsertPoint = Inst->getNextNode();
   if (!InsertPoint || isa<ConstantInt>(Inst))
     return;
-  Constant *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst));
+  Constant *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst, "ICmp"));
   processCmp(Inst, Cid, InsertPoint);
 }
 
@@ -700,7 +742,7 @@ void AngoraLLVMPass::visitBranchInst(Instruction *Inst) {
     if (Cond && Cond->getType()->isIntegerTy() && !isa<ConstantInt>(Cond)) {
       if (!isa<CmpInst>(Cond)) {
         // From  and, or, call, phi ....
-        Constant *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst));
+        Constant *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst, "Branch"));
         processBoolCmp(Cond, Cid, Inst);
       }
     }
@@ -721,7 +763,7 @@ void AngoraLLVMPass::visitSwitchInst(Module &M, Instruction *Inst) {
   if (num_bytes == 0 || num_bits % 8 > 0)
     return;
 
-  Constant *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst));
+  Constant *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst, "Switch"));
   IRBuilder<> IRB(Sw);
 
   if (FastMode) {
@@ -792,7 +834,8 @@ void AngoraLLVMPass::visitExploitation(Instruction *Inst) {
       Type *ParamType = ParamVal->getType();
       if (ParamType->isIntegerTy() || ParamType->isPointerTy()) {
         if (!isa<ConstantInt>(ParamVal)) {
-          ConstantInt *Cid = ConstantInt::get(Int32Ty, getInstructionId(Inst));
+          ConstantInt *Cid = ConstantInt::get(
+              Int32Ty, getInstructionId(Inst, Instruction::getOpcodeName(Inst->getOpcode())));
           int size = ParamVal->getType()->getScalarSizeInBits() / 8;
           if (ParamType->isPointerTy()) {
             size = 8;
@@ -830,6 +873,38 @@ bool AngoraLLVMPass::runOnModule(Module &M) {
   }
 
   initVariables(M);
+
+  /* Not part of the vendored-unmodified original -- see cmpid_log_file's
+     own comment. Skipped under DFSanMode: that mode returns before any
+     cmpid ever gets assigned (see the early return just below), so
+     there'd be nothing to log and no matching close() call to pair
+     with an open one. ANGORA_PASS_LOG_DIR mirrors the env var
+     Reusing_mut/llvm_mode/pass/AngoraPass.cc's own copy of this feature
+     already uses; angora-reusing-target/Dockerfile sets it per-target
+     before compiling for that copy, and the same convention is expected
+     here now that this copy also writes the file. */
+  if (!DFSanMode) {
+
+    std::string log_dir = "/angora";
+    const char *env_log_dir = getenv("ANGORA_PASS_LOG_DIR");
+    if (env_log_dir) { log_dir = std::string(env_log_dir); }
+
+    std::string log_path = log_dir + (TrackMode ? "/cmpid_track.txt" : "/cmpid_fast.txt");
+
+    cmpid_log_file.open(log_path, std::ios::out | std::ios::app);
+    if (cmpid_log_file.is_open()) {
+
+      cmpid_log_file << "# Module: " << ModName << " (ModId: " << ModId << ")\n";
+      cmpid_log_file << "# Format: cmpid: filename, line, column, [InstType]\n";
+      OKF("cmpid_log_file opened at: %s", log_path.c_str());
+
+    } else {
+
+      errs() << "Warning: could not open cmpid log at " << log_path << "\n";
+
+    }
+
+  }
 
   if (DFSanMode)
     return true;
@@ -879,6 +954,17 @@ bool AngoraLLVMPass::runOnModule(Module &M) {
 
   if (is_bc)
     OKF("Max constraint id is %d", CidCounter);
+
+  /* Not part of the vendored-unmodified original -- see cmpid_log_file's
+     own comment. Pairs with the open() above (unreachable when
+     DFSanMode's early return fires, same as that open() itself). */
+  if (cmpid_log_file.is_open()) {
+
+    cmpid_log_file.close();
+    OKF("cmpid_log_file closed, total unique IDs: %u", (unsigned)UniqCidSet.size());
+
+  }
+
   return true;
 }
 

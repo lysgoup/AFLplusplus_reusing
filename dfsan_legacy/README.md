@@ -26,10 +26,16 @@ Both implementations coexist; nothing here replaces the other one.
 
 ## What's here
 
-- `pass/` -- Angora's actual `DFSanPass.cc`/`AngoraPass.cc`/
-  `UnfoldBranchPass.cc`, byte-for-byte unmodified. Confirmed to compile and
-  run correctly against the real LLVM 11.1.0 release with **zero source
-  changes** (see verification below).
+- `pass/` -- Angora's actual `DFSanPass.cc`/`UnfoldBranchPass.cc`,
+  byte-for-byte unmodified, confirmed to compile and run correctly
+  against the real LLVM 11.1.0 release with **zero source changes** (see
+  verification below). `AngoraPass.cc` carries one deliberate deviation:
+  a cmpid -> source-location text log (`cmpid_log_file`, opened/closed in
+  `runOnModule()`), ported from `/home/yunseo/Reusing_mut/llvm_mode/
+  pass/AngoraPass.cc`'s own copy of this same pass, which already had it.
+  See that file's own comments (search `cmpid_log_file`) for the exact
+  diff; output path and `cmpid_track.txt`/`cmpid_fast.txt` naming match
+  that copy's `ANGORA_PASS_LOG_DIR` convention.
 - `dfsan_rt/` -- Angora's actual compiler-rt DFSan runtime fork, vendored
   unmodified except `dfsan/dfsan.cc`'s FFI redirection (see that file's own
   comments) and the length-label strip/reattach fixes described below.
