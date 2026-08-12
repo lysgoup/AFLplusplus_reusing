@@ -810,7 +810,52 @@ void afl_parse_commandline(afl_state_t *afl, int argc, char **argv) {
 
   #endif
 
+  /* --analysis-mode (include/afl-fuzz.h's own reusing_analysis_mode
+     comment) isn't a real AFL++ option -- getopt() below is short-opts
+     only (see the optstring literal just past this block, and its own
+     "still available" letter-budget comment), so a bare "--xxx" long
+     flag has no slot to land in and getopt() would otherwise choke on
+     the leading second '-'. Filtered out of a filtered *copy* of argv
+     here, before argv_cpy_dup()/getopt() (and every optind-relative
+     access later in this function) ever see it, so nothing past this
+     point needs to know the flag existed at all -- argc/argv themselves
+     get reassigned to the filtered copy, not just a side variable, since
+     every later use in this function (getopt's own argc/argv, the
+     optind-vs-argc bounds checks further down) reads these same two
+     parameters directly. Matches Angora's own flag of the same name
+     (fuzzer/src/bin/fuzzer.rs in the sibling Reusing_mut repo) so a
+     captainrc's GLOBAL_FUZZARGS shared across fuzzer types doesn't break
+     when it reaches an aflplusplus-reusing campaign. */
+  {
+
+    char **filtered = ck_alloc((size_t)(argc + 1) * sizeof(char *));
+    s32    n = 0;
+
+    for (s32 i = 0; i < argc; ++i) {
+
+      if (i > 0 && !strcmp(argv[i], "--analysis-mode")) {
+
+        afl->reusing_analysis_mode = 1;
+        continue;
+
+      }
+
+      filtered[n++] = argv[i];
+
+    }
+
+    filtered[n] = NULL;
+    argc = n;
+    argv = filtered;
+
+  }
+
   char **argv_dup = argv_cpy_dup(argc, argv);
+  ck_free(argv);    /* the --analysis-mode-filtered array built above --
+                        argv_cpy_dup() just made its own real copy, this
+                        one (just an array of borrowed pointers into the
+                        caller's original argv strings, not the strings
+                        themselves) has nothing left to do */
   argv = argv_dup;
   afl->argv_cpy = argv_dup;
   afl->argc_cpy = argc;
@@ -3045,6 +3090,34 @@ void afl_alloc_shared_memory(afl_state_t *afl) {
     afl->reusing_filter = reusing_filter_select();
     afl->reusing_seen = reusing_seen_create();
 
+    /* --analysis-mode diagnostic log (src/afl-fuzz-reusing-mutate.c writes
+       the actual rows) -- same gate as reusing_pool above, plus the flag
+       itself. A failure to open is a warning, not fatal: analysis-mode is
+       opt-in tooling, not something a campaign's actual fuzzing depends
+       on. */
+    if (afl->reusing_analysis_mode) {
+
+      u8 *analysis_path = alloc_printf("%s/analysis_reusing.csv", afl->out_dir);
+      afl->reusing_analysis_file = fopen((char *)analysis_path, "w");
+
+      if (afl->reusing_analysis_file) {
+
+        fprintf(afl->reusing_analysis_file,
+               "new_input_id,parent_input_id,mutate_cmpid,mutate_context,"
+               "mutate_condition,origin_cmpid,origin_context,origin_condition,"
+               "offset_ranges,hex_value\n");
+        fflush(afl->reusing_analysis_file);
+
+      } else {
+
+        WARNF("Could not open %s for --analysis-mode", analysis_path);
+
+      }
+
+      ck_free(analysis_path);
+
+    }
+
   }
 
   load_auto(afl);
@@ -3803,6 +3876,8 @@ void stop_fuzzing(afl_state_t *afl) {
   }
 
   if (afl->reusing_seen) { reusing_seen_free(afl->reusing_seen); }
+
+  if (afl->reusing_analysis_file) { fclose(afl->reusing_analysis_file); }
 
   /* remove tmpfile */
   if (!afl->in_place_resume && afl->fsrv.out_file) {

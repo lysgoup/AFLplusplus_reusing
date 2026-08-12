@@ -103,6 +103,55 @@ static void add_site(afl_state_t *afl, const struct dtaint_cond_record *cond,
 
 }
 
+/* --analysis-mode diagnostic (include/afl-fuzz.h's own reusing_analysis_
+   mode/reusing_analysis_file comments) -- one row per splice that just
+   produced a new queue entry, mirroring Angora's own analysis_
+   <thread_id>.csv reusing_detail column but split into mutate_ and
+   origin_ fields: unlike Angora's pool (keyed directly by cmpid, so a value's
+   origin and its use site are always the same comparison), this pool is
+   keyed by pattern (byte-shape) -- see include/reusing_pool.h's own
+   reusing_record_t comment -- so a value captured at one comparison can
+   legitimately get spliced into a completely different one, and losing
+   that distinction would lose exactly the information this log exists
+   to capture. No-op (checked by the caller, not duplicated here) when
+   --analysis-mode wasn't passed. */
+static void log_reuse_analysis(afl_state_t *afl, const reusing_site_t *site,
+                               const reusing_record_t *record) {
+
+  /* Quoted -- AFL's own queue filenames are themselves comma-separated
+     ("id:NNNNNN,src:NNNNNN,time:...,op:...,..."), so writing them bare
+     would silently misalign every downstream CSV column. No quote-
+     doubling needed: AFL never puts a literal '"' in a filename it
+     generates itself (describe_op()'s charset doesn't include one). */
+  const char *new_fname =
+      (const char *)afl->queue_buf[afl->queued_items - 1]->fname;
+  const char *parent_fname = (const char *)afl->queue_cur->fname;
+
+  fprintf(afl->reusing_analysis_file, "\"%s\",\"%s\",%u,%u,%u,%u,%u,%u,",
+         new_fname, parent_fname, site->cond->cmpid, site->cond->context,
+         site->cond->condition, record->cmpid, record->context,
+         record->condition);
+
+  for (u32 s = 0; s < site->n_segs; ++s) {
+
+    fprintf(afl->reusing_analysis_file, "%s%u-%u", s ? ";" : "",
+           site->segs[s].begin, site->segs[s].end);
+
+  }
+
+  fputc(',', afl->reusing_analysis_file);
+
+  for (u32 i = 0; i < record->value_len; ++i) {
+
+    fprintf(afl->reusing_analysis_file, "%02x", record->value[i]);
+
+  }
+
+  fputc('\n', afl->reusing_analysis_file);
+  fflush(afl->reusing_analysis_file);
+
+}
+
 u8 reusing_mutation_stage(afl_state_t *afl, u8 *in_buf, u8 *out_buf, u32 len) {
 
   if (!afl->reusing_pool) { return 0; }
@@ -219,11 +268,27 @@ u8 reusing_mutation_stage(afl_state_t *afl, u8 *in_buf, u8 *out_buf, u32 len) {
                afl->queue_cur->fname, site->cond->cmpid);
 #endif
 
+      /* Snapshotted per-splice, not once for the whole stage the way
+         orig_hit_cnt/new_hit_cnt below already is -- common_fuzz_stuff()'s
+         own return value means "abandon this stage" (afl->stop_soon, a
+         timeout storm, or SIGUSR1 -- see its own implementation,
+         src/afl-fuzz-run.c), *not* "this splice found something", so it
+         can't be used to decide whether to log this particular attempt.
+         Comparing queued_items before/after is what actually attributes
+         a find to *this* (site, value) pair specifically. */
+      u32 pre_queued_items = afl->queued_items;
+
       if (common_fuzz_stuff(afl, out_buf, len)) {
 
         ret = 1;
         free(chosen.indices);
         goto cleanup;
+
+      }
+
+      if (afl->reusing_analysis_file && afl->queued_items > pre_queued_items) {
+
+        log_reuse_analysis(afl, site, val.record);
 
       }
 

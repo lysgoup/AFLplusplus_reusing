@@ -878,6 +878,22 @@ typedef struct afl_state {
      reusing_pool above. */
   struct reusing_seen *reusing_seen;
 
+  /* Set by afl_parse_commandline() when --analysis-mode is on argv --
+     mirrors Angora's own fuzzer/src/bin/fuzzer.rs `--analysis-mode`
+     (same name, same spirit: per-successful-reuse-splice diagnostic
+     logging, opt-in because of the file-I/O cost). Not a real getopt()
+     option (see afl_parse_commandline's own comment on why it's filtered
+     out of argv before getopt ever sees it) since AFL++'s CLI is
+     short-opts-only. */
+  u8 reusing_analysis_mode;
+
+  /* <out_dir>/analysis_reusing.csv, opened iff reusing_analysis_mode AND
+     reusing_pool are both set (see afl-fuzz.c, same call site that
+     creates reusing_pool) -- one row per successful reuse-stage splice,
+     written from src/afl-fuzz-reusing-mutate.c. NULL otherwise; every
+     writer must check before using it. */
+  FILE *reusing_analysis_file;
+
   /* ASAN Fuzing */
   char            *san_binary[MAX_EXTRA_SAN_BINARY];
   afl_forkserver_t san_fsrvs[MAX_EXTRA_SAN_BINARY];
