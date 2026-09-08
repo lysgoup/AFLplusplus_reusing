@@ -1,0 +1,11 @@
+# Ported from Angora_original/llvm_mode/external_lib/zlib_abilist.txt: of
+# all zlib functions, Angora gives *only* crc32 a precise custom model
+# (every other zlib function -- inflate/deflate/gz* -- is `discard`, same
+# as this build's auto-generated ANGORA_TAINT_RULE_LIST). See
+# runtime/dtaint_legacy_hooks.c's __dfsw_crc32 (ported from
+# external_lib/zlib_func.c) for the implementation. Kept as its own file
+# (rather than folded into the auto-generated per-target discard list) so
+# it isn't accidentally overwritten by that generator if crc32 ever also
+# matches its own "everything this target links against" sweep -- the
+# Dockerfile explicitly excludes `fun:crc32=` from that generated list.
+fun:crc32=custom

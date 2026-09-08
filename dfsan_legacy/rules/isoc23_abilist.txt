@@ -1,0 +1,25 @@
+# Ubuntu Noble's glibc (2.38+) redirects strtol/strtoul/strtoll/strtoull to
+# these __isoc23_-prefixed symbols via a GCC __asm__-label redirect on the
+# *declaration* (not a simple preprocessor #define) -- confirmed via -emit-
+# llvm that the IR itself still shows a plain @strtol call/declare, so
+# DFSanPass's abilist match on "strtol"/"custom" fires correctly and
+# generates the expected __dfsw_strtol call... but the compiler then lowers
+# the auto-generated indirect-call-safe trampoline itself (DFSan's own
+# "dfs$<name>" symbol, unrelated to the __dfsw_ custom-wrapper path) under
+# the asm-redirected name, i.e. "dfs$__isoc23_strtol", not "dfs$strtol" --
+# and nothing in Angora's vendored dfsan_rt provides a definition under
+# that exact name. `custom` here (paired with hand-written
+# __dfsw___isoc23_* delegates in dtaint_legacy_hooks.c) does *not* fix this
+# -- it's the auto-generated dfs$ trampoline that's missing a definition,
+# not the __dfsw_ wrapper. `discard` sidesteps this entirely: DFSan
+# generates the dfs$ trampoline for "discard"-category functions itself
+# (a self-contained weak definition, no external symbol needed), at the
+# cost of not propagating taint through strtol-parsed values specifically
+# when reached via this glibc-version-specific redirected name (a real,
+# accepted accuracy loss for argv/getenv-sourced numeric parsing -- this
+# project's validation has focused on file-sourced taint via fread/read,
+# not argv, so the impact is expected to be minor).
+fun:__isoc23_strtol=discard
+fun:__isoc23_strtoul=discard
+fun:__isoc23_strtoll=discard
+fun:__isoc23_strtoull=discard
