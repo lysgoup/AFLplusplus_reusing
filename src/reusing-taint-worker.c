@@ -212,28 +212,47 @@ static void usage(u8 *argv0) {
       "                  (default: none)\n"
       "  -p sec        - live mode: queue poll interval in seconds "
       "(default: 2)\n"
-      "  -D dict_path  - accumulate tainted values behind a NEW comparison "
-      "outcome\n"
-      "                  (a (site, context, condition) combo never seen "
-      "before in\n"
-      "                  this run) across the whole run (both modes), and "
-      "write\n"
-      "                  it out once the run ends. Every line is a JSON-"
-      "style\n"
-      "                  array of quoted, \\xNN-escaped byte strings -- "
-      "[\"...\"]\n"
-      "                  for a magic-byte chain (see above) or a single-"
-      "segment\n"
-      "                  value, [\"...\",\"...\"] for a multi-segment "
-      "taint label\n"
-      "                  (each element one segment, in order). NOT AFL++ "
-      "-x\n"
-      "                  syntax -- meant for a downstream reader of this "
-      "tool's\n"
-      "                  own. Anything shorter than 2 bytes is dropped "
-      "unless\n"
-      "                  it's part of a multi-segment label.\n"
       "  -Q            - quiet mode\n\n"
+
+      "Always on, no flag needed, written once the run ends, next to "
+      "wherever\n"
+      "this run's own .dtaint outputs land (work_dir):\n"
+      "  value_pool.dict      - every tainted value behind a NEW comparison "
+      "\n"
+      "                         outcome (a (site, context, condition) combo "
+      "\n"
+      "                         never seen before in this run), across both "
+      "\n"
+      "                         modes' full lifetime. Each line is a JSON-"
+      "style\n"
+      "                         array of quoted, \\xNN-escaped byte strings "
+      "--\n"
+      "                         [\"...\"] for a magic-byte chain or a "
+      "single-\n"
+      "                         segment value, [\"...\",\"...\"] for a "
+      "multi-\n"
+      "                         segment taint label (one element per "
+      "segment,\n"
+      "                         in order). NOT AFL++ -x syntax -- meant for "
+      "a\n"
+      "                         downstream reader of this tool's own. "
+      "Anything\n"
+      "                         shorter than 2 bytes is dropped unless it's "
+      "part\n"
+      "                         of a multi-segment label. Rows are sorted "
+      "by\n"
+      "                         segment-length pattern, annotated with "
+      "\"# label\n"
+      "                         pattern: [...]\" comments.\n"
+      "  unsolved_condition   - every (cmpid, context) site whose "
+      "condition has\n"
+      "                         never gone more than one way across "
+      "everything\n"
+      "                         analyzed so far (a switch always counts as "
+      "\n"
+      "                         unsolved) -- just cmpid and context, meant "
+      "as\n"
+      "                         mutation targets still worth attacking.\n\n"
 
       "Use '@@' in the target command line to have it substituted with the "
       "path\n"
@@ -543,8 +562,7 @@ static u8 dict_contains(worker_dict_t *d, const u8 *data, u32 len) {
 
 /* No-op if data/len is empty, absurdly long for a magic constant (32+
    bytes strongly suggests a mis-grouped run, not a real fixed value), the
-   dict is disabled (d == NULL, -D not given), the global cap is already
-   hit, or this exact value is already in the set. */
+   global cap is already hit, or this exact value is already in the set. */
 static void dict_add(worker_dict_t *d, const u8 *data, u32 len) {
 
   if (!d || !data || !len || len > WORKER_DICT_MAX_ENTRY_LEN) return;
@@ -995,6 +1013,186 @@ static u8 novelty_check_and_mark(novelty_set_t *s, u32 cmpid, u32 context, u32 c
 
 }
 
+/* ---------------------------------------------------------------------- */
+/* Unsolved-condition tracking -- for every (cmpid, context) site that has */
+/* taint, remembers which distinct `condition` outcomes have been seen     */
+/* across every input this process has ever analyzed (live campaign or -S  */
+/* batch alike), so a downstream reader knows which sites have never gone  */
+/* more than one way. A site counts as "solved" once 2+ distinct outcomes  */
+/* have been observed -- except a switch (DTAINT_COND_SW_OP), which has no */
+/* fixed "the other side": it's always reported, no matter how many cases  */
+/* have fired.                                                             */
+/* ---------------------------------------------------------------------- */
+
+#define COND_STATUS_INITIAL_CAP 4096
+
+typedef struct {
+
+  u32           cmpid;
+  u32           context;
+  u32           op;
+  u32           n_distinct;
+  u32           seen_conditions[2];
+  u8            used;
+
+} cond_status_slot_t;
+
+typedef struct {
+
+  cond_status_slot_t *slots;
+  u32                  cap;
+  u32                  count;
+
+} cond_status_set_t;
+
+static void cond_status_init(cond_status_set_t *s) {
+
+  s->cap = COND_STATUS_INITIAL_CAP;
+  s->slots = ck_alloc(s->cap * sizeof(cond_status_slot_t));
+  s->count = 0;
+
+}
+
+static u32 cond_status_hash(u32 cmpid, u32 context) {
+
+  u32 h = cmpid;
+  h = h * 2654435761u ^ context;
+  return h;
+
+}
+
+static cond_status_slot_t *cond_status_raw_insert(cond_status_set_t *s, u32 cmpid, u32 context) {
+
+  u32 idx = cond_status_hash(cmpid, context) % s->cap;
+
+  while (s->slots[idx].used) idx = (idx + 1) % s->cap;
+
+  memset(&s->slots[idx], 0, sizeof(cond_status_slot_t));
+  s->slots[idx].used = 1;
+  s->slots[idx].cmpid = cmpid;
+  s->slots[idx].context = context;
+  s->count++;
+
+  return &s->slots[idx];
+
+}
+
+static void cond_status_grow(cond_status_set_t *s) {
+
+  cond_status_slot_t *old_slots = s->slots;
+  u32                  old_cap = s->cap;
+
+  s->cap *= 2;
+  s->slots = ck_alloc(s->cap * sizeof(cond_status_slot_t));
+  s->count = 0;
+
+  for (u32 i = 0; i < old_cap; i++) {
+
+    if (old_slots[i].used) {
+
+      cond_status_slot_t *ns = cond_status_raw_insert(s, old_slots[i].cmpid, old_slots[i].context);
+      *ns = old_slots[i];
+
+    }
+
+  }
+
+  ck_free(old_slots);
+
+}
+
+static cond_status_slot_t *cond_status_find_or_create(cond_status_set_t *s, u32 cmpid, u32 context) {
+
+  if ((u64)(s->count + 1) * 4 >= (u64)s->cap * 3) cond_status_grow(s);
+
+  u32 idx = cond_status_hash(cmpid, context) % s->cap;
+
+  while (s->slots[idx].used) {
+
+    if (s->slots[idx].cmpid == cmpid && s->slots[idx].context == context) return &s->slots[idx];
+    idx = (idx + 1) % s->cap;
+
+  }
+
+  return cond_status_raw_insert(s, cmpid, context);
+
+}
+
+/* Records one more sighting of (cmpid, context): updates op, adds
+   `condition` to the distinct-outcomes set if it's not already there (only
+   the first two distinct values are kept -- that's all "solved" needs),
+   and overwrites the stored offsets with this sighting's (so the report
+   reflects the most recent occurrence, not necessarily the first). */
+static void cond_status_update(cond_status_set_t *s, u32 cmpid, u32 context, u32 op,
+                               u32 condition) {
+
+  if (!s) return;
+
+  cond_status_slot_t *slot = cond_status_find_or_create(s, cmpid, context);
+  slot->op = op;
+
+  u8 known = 0;
+
+  for (u32 i = 0; i < slot->n_distinct; i++) {
+
+    if (slot->seen_conditions[i] == condition) known = 1;
+
+  }
+
+  if (!known && slot->n_distinct < 2) slot->seen_conditions[slot->n_distinct++] = condition;
+
+}
+
+static void unsolved_write(cond_status_set_t *s, const char *path) {
+
+  if (!s || !s->count) return;
+
+  FILE *f = fopen(path, "w");
+  if (!f) {
+
+    WARNF("Could not open '%s' for writing unsolved conditions: %s", path, strerror(errno));
+    return;
+
+  }
+
+  u32 n_unsolved = 0;
+
+  for (u32 i = 0; i < s->cap; i++) {
+
+    if (!s->slots[i].used) continue;
+
+    u8 is_switch = (s->slots[i].op & WORKER_OP_BASIC_MASK) == DTAINT_COND_SW_OP;
+    u8 solved = !is_switch && s->slots[i].n_distinct >= 2;
+    if (!solved) n_unsolved++;
+
+  }
+
+  fprintf(f, "# unsolved conditions -- %u of %u tracked site(s) never seen both ways "
+             "(cmpid, context)\n", n_unsolved, s->count);
+
+  for (u32 i = 0; i < s->cap; i++) {
+
+    if (!s->slots[i].used) continue;
+
+    cond_status_slot_t *slot = &s->slots[i];
+    u8 is_switch = (slot->op & WORKER_OP_BASIC_MASK) == DTAINT_COND_SW_OP;
+    u8 solved = !is_switch && slot->n_distinct >= 2;
+    if (solved) continue;
+
+    fprintf(f, "cmpid=%u context=%u\n", slot->cmpid, slot->context);
+
+  }
+
+  fclose(f);
+
+  if (!quiet_mode) {
+
+    OKF("Wrote %u unsolved condition(s) (of %u tracked) to '%s'.", n_unsolved, s->count, path);
+
+  }
+
+}
+
 typedef struct {
 
   u32                         label;
@@ -1061,16 +1259,16 @@ static int cmp_magic_candidate(const void *a, const void *b) {
    run's output), -1 on a real I/O error. Never touches scratch_path
    itself -- the caller decides whether to unlink or keep it.
 
-   orig_input/orig_input_len is the exact buffer this run was fed (NULL/0
-   to skip dictionary extraction entirely, e.g. if -D wasn't given); dict
-   and novelty together drive that extraction (see the unified pass
-   further down), both NULL to disable it. */
+   orig_input/orig_input_len is the exact buffer this run was fed. dict,
+   novelty, and cond_status (all always non-NULL, see main()) drive the
+   value_pool.dict / unsolved_condition extraction pass further down. */
 static int transcode_dtaint_with_magic_groups(const char *scratch_path,
                                               const char *dest_path,
                                               const u8 *orig_input,
                                               u32 orig_input_len,
                                               worker_dict_t *dict,
-                                              novelty_set_t *novelty) {
+                                              novelty_set_t *novelty,
+                                              cond_status_set_t *cond_status) {
 
   s32 fd = open(scratch_path, O_RDONLY);
   if (fd < 0) return -1;
@@ -1203,30 +1401,38 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
 
   if (cand) ck_free(cand);
 
-  /* --- interesting-value extraction: for every tainted comparison,
-     regardless of op or outcome, that produced a (cmpid, context,
-     condition) combination never seen before in this process's lifetime,
-     record its tainted bytes. A grouped byte-chain (see above) becomes
-     one combined value, since it's already established as one genuinely
-     contiguous span. Otherwise this uses whichever of lb1/lb2 is the
-     "primary" side (see pick_primary_side()): a single-segment tag stores
-     that one span (dropped if it's only 1 byte -- rarely meaningful
-     alone); a multi-segment tag stores each segment on its own (same
-     1-byte drop, applied per segment) *and*, separately, every segment of
-     that same label under one shared group_id (see dict_add_group()) so
-     which segments co-occurred in the same label stays recoverable even
-     though they're never concatenated into a single blob. */
+  /* --- interesting-value extraction, and unsolved-condition tracking --
+     for every tainted comparison, regardless of op or outcome, that
+     produced a (cmpid, context, condition) combination never seen before
+     in this process's lifetime: (1) feed value_pool.dict, and (2) update
+     unsolved_condition's per-(cmpid, context) outcome history (see
+     cond_status_update()) -- both gated on the same novelty check, so a
+     site that's already fully explored doesn't cost anything on repeat
+     sightings.
 
-  for (u32 i = 0; dict && novelty && orig_input && i < hdr.n_conds; i++) {
+     For the dict: a grouped byte-chain (see above) becomes one combined
+     value, since it's already established as one genuinely contiguous
+     span. Otherwise this uses whichever of lb1/lb2 is the "primary" side
+     (see pick_primary_side()): a single-segment tag stores that one span
+     (dropped if it's only 1 byte -- rarely meaningful alone); a multi-
+     segment tag stores each segment on its own (same 1-byte drop, applied
+     per segment) *and*, separately, every segment of that same label
+     under one shared group_id (see dict_add_group()) so which segments
+     co-occurred in the same label stays recoverable even though they're
+     never concatenated into a single blob. */
+
+  for (u32 i = 0; orig_input && i < hdr.n_conds; i++) {
 
     if (!conds[i].lb1 && !conds[i].lb2) continue;
-    if (!novelty_check_and_mark(novelty, conds[i].cmpid, conds[i].context, conds[i].condition)) {
 
-      continue;
-
-    }
+    u8 is_novel = novelty_check_and_mark(novelty, conds[i].cmpid, conds[i].context,
+                                         conds[i].condition);
+    if (!is_novel) continue;
 
     if (group_end[i] > group_begin[i]) {
+
+      cond_status_update(cond_status, conds[i].cmpid, conds[i].context, conds[i].op,
+                         conds[i].condition);
 
       if (group_end[i] <= orig_input_len) {
 
@@ -1241,6 +1447,9 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
     worker_tag_lookup_t *primary =
         pick_primary_side(tags, hdr.n_tags, conds[i].lb1, conds[i].lb2);
     if (!primary || !primary->n_segs) continue;
+
+    cond_status_update(cond_status, conds[i].cmpid, conds[i].context, conds[i].op,
+                       conds[i].condition);
 
     if (primary->n_segs > 1) {
 
@@ -1345,6 +1554,7 @@ static void process_queue_entry(afl_forkserver_t *fsrv, const char *src_dir,
                                 const char *input_seed_dir,
                                 worker_dict_t *dict,
                                 novelty_set_t *novelty,
+                                cond_status_set_t *cond_status,
                                 const char *fname) {
 
   u8 *orig_name = extract_orig_name(fname);
@@ -1456,7 +1666,7 @@ static void process_queue_entry(afl_forkserver_t *fsrv, const char *src_dir,
 
     u8 *dest_path = alloc_printf("%s/%s.dtaint", work_dir, fname);
     int tc = transcode_dtaint_with_magic_groups((char *)scratch_path, (char *)dest_path,
-                                                buf, len, dict, novelty);
+                                                buf, len, dict, novelty, cond_status);
 
     if (tc == 0) {
 
@@ -1499,7 +1709,7 @@ static void process_queue_entry(afl_forkserver_t *fsrv, const char *src_dir,
    runs the forkserver on every file and files away whatever comes out. */
 static void run_seed_scan(afl_forkserver_t *fsrv, const char *seed_dir,
                           const char *out_dir, worker_dict_t *dict,
-                          novelty_set_t *novelty) {
+                          novelty_set_t *novelty, cond_status_set_t *cond_status) {
 
   DIR *d = opendir(seed_dir);
   if (!d) { PFATAL("Unable to open seed dir '%s'", seed_dir); }
@@ -1517,7 +1727,7 @@ static void run_seed_scan(afl_forkserver_t *fsrv, const char *seed_dir,
 #endif
     if (de->d_name[0] == '.') continue;
 
-    process_queue_entry(fsrv, seed_dir, out_dir, NULL, NULL, dict, novelty, de->d_name);
+    process_queue_entry(fsrv, seed_dir, out_dir, NULL, NULL, dict, novelty, cond_status, de->d_name);
     ++n;
 
   }
@@ -1541,7 +1751,6 @@ int main(int argc, char **argv_orig, char **envp) {
   u8  *seed_scan_dir = NULL;
   u8  *seed_cache_dir = NULL;
   u8  *input_seed_dir = NULL;
-  u8  *dict_out_path = NULL;
   u32  exec_tmout = 5000;
   u64  mem_limit = 0;
   u32  poll_interval_sec = 2;
@@ -1550,7 +1759,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   if (getenv("AFL_QUIET") != NULL) { quiet_mode = 1; }
 
-  while ((opt = getopt(argc, argv, "+o:S:c:i:t:m:p:D:Qh")) > 0) {
+  while ((opt = getopt(argc, argv, "+o:S:c:i:t:m:p:Qh")) > 0) {
 
     switch (opt) {
 
@@ -1576,15 +1785,6 @@ int main(int argc, char **argv_orig, char **envp) {
            filename (see process_queue_entry()'s is_known_seed check). */
         if (input_seed_dir) { FATAL("Multiple -i options not supported"); }
         input_seed_dir = (u8 *)optarg;
-        break;
-
-      case 'D':
-        /* Where to write the extracted magic-byte-value dictionary at
-           exit (AFL++ -x format). Works in either mode: accumulates
-           across the whole -S batch, or across a live campaign's full
-           lifetime, and is written once, when the run actually ends. */
-        if (dict_out_path) { FATAL("Multiple -D options not supported"); }
-        dict_out_path = (u8 *)optarg;
         break;
 
       case 't':
@@ -1643,20 +1843,6 @@ int main(int argc, char **argv_orig, char **envp) {
 
     FATAL("-i is live-mode only -- -S already takes the seed dir directly "
           "as its argument.");
-
-  }
-
-  worker_dict_t  dict_storage;
-  worker_dict_t *dict = NULL;
-  novelty_set_t  novelty_storage;
-  novelty_set_t *novelty = NULL;
-
-  if (dict_out_path) {
-
-    dict_init(&dict_storage);
-    dict = &dict_storage;
-    novelty_init(&novelty_storage);
-    novelty = &novelty_storage;
 
   }
 
@@ -1750,6 +1936,23 @@ int main(int argc, char **argv_orig, char **envp) {
 
   }
 
+  /* Always on, always alongside wherever the .dtaint outputs themselves
+     land (work_dir) -- value_pool.dict and unsolved_condition, fixed
+     names, no CLI knob. */
+  worker_dict_t        dict_storage;
+  novelty_set_t        novelty_storage;
+  cond_status_set_t    cond_status_storage;
+  worker_dict_t        *dict = &dict_storage;
+  novelty_set_t        *novelty = &novelty_storage;
+  cond_status_set_t    *cond_status = &cond_status_storage;
+
+  dict_init(dict);
+  novelty_init(novelty);
+  cond_status_init(cond_status);
+
+  u8 *dict_out_path = alloc_printf("%s/value_pool.dict", work_dir);
+  u8 *unsolved_out_path = alloc_printf("%s/unsolved_condition", work_dir);
+
   worker_setup_signal_handlers();
 
   afl_forkserver_t fsrv_var = {0};
@@ -1816,9 +2019,14 @@ int main(int argc, char **argv_orig, char **envp) {
 
     /* -S is a one-shot job: scan, then exit -- no queue/ to watch, no
        campaign this invocation is part of. */
-    if (!stop_soon) { run_seed_scan(fsrv, (char *)seed_scan_dir, (char *)work_dir, dict, novelty); }
+    if (!stop_soon) {
 
-    if (dict) dict_write(dict, (char *)dict_out_path);
+      run_seed_scan(fsrv, (char *)seed_scan_dir, (char *)work_dir, dict, novelty, cond_status);
+
+    }
+
+    dict_write(dict, (char *)dict_out_path);
+    unsolved_write(cond_status, (char *)unsolved_out_path);
 
     if (fsrv->out_fd >= 0 && !fsrv->use_stdin) { unlink((char *)stdin_file); }
     ck_free(stdin_file);
@@ -1847,7 +2055,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
       process_queue_entry(fsrv, (char *)queue_dir, (char *)work_dir,
                           (char *)seed_cache_dir, (char *)input_seed_dir,
-                          dict, novelty, (char *)entries[i].name);
+                          dict, novelty, cond_status, (char *)entries[i].name);
       last_id = entries[i].id;
       free(entries[i].name);
 
@@ -1861,7 +2069,8 @@ int main(int argc, char **argv_orig, char **envp) {
 
   if (!quiet_mode) { OKF("Stopping."); }
 
-  if (dict) dict_write(dict, (char *)dict_out_path);
+  dict_write(dict, (char *)dict_out_path);
+  unsolved_write(cond_status, (char *)unsolved_out_path);
 
   if (fsrv->out_fd >= 0 && !fsrv->use_stdin) { unlink((char *)stdin_file); }
   ck_free(stdin_file);
