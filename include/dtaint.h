@@ -199,6 +199,57 @@ struct dtaint_file_header {
 #define DTAINT_FILE_VERSION 2U
 
 /* ---------------------------------------------------------------------- */
+/* reusing-taint-worker's own output format (src/reusing-taint-worker.c). */
+/*                                                                          */
+/* dfsan_legacy's runtime (dtaint_runtime/dtaint_logger.c) only ever      */
+/* writes DTAINT_FILE_VERSION==2, plain dtaint_cond_record entries -- that */
+/* format is unchanged above and is what a dtaint-instrumented target      */
+/* produces raw, on every run. reusing-taint-worker.c is the sole reader   */
+/* of that raw scratch file: after each run it transcodes it into this     */
+/* version-3 format before persisting/caching, gluing runs of adjacent     */
+/* single-byte magic-byte comparisons (see is_magic_byte_cmp() below)      */
+/* into one combined offset span per group -- ported from Angora's own    */
+/* fuzzer/src/track/fparser.rs::group_adjacent_one_byte_magic_bytes(),      */
+/* which this mirrors field-for-field. Nothing downstream of the worker   */
+/* (the fuzzer, the instrumentation passes) ever sees or produces v2      */
+/* files directly, so bumping the version here doesn't affect them.        */
+/* ---------------------------------------------------------------------- */
+#define DTAINT_FILE_VERSION_GROUPED 3U
+
+/* Same fields as dtaint_cond_record, plus the combined offset span of the
+   magic-byte group this record was merged into (see above). Both are 0 for
+   a record that isn't part of any group (either not a magic-byte
+   comparison at all, or a magic-byte comparison with no contiguous
+   same-context neighbor) -- check magic_group_end > magic_group_begin to
+   tell "grouped" from "ungrouped", not just nonzero, since offset 0 is a
+   valid group start. Every member of the same group carries an identical
+   [magic_group_begin, magic_group_end) span, exactly mirroring how
+   fparser.rs assigns the same cloned `group` Vec to every member index in
+   its run. */
+struct dtaint_cond_record_grouped {
+
+  u32 cmpid;
+  u32 context;
+  u32 order;
+  u32 belong;
+
+  u32 condition;
+  u32 level;
+  u32 op;
+  u32 size;
+
+  u32 lb1;
+  u32 lb2;
+
+  u64 arg1;
+  u64 arg2;
+
+  u32 magic_group_begin;
+  u32 magic_group_end;
+
+};
+
+/* ---------------------------------------------------------------------- */
 /* Runtime API the LLVM pass's inserted calls target (defined across the   */
 /* dtaint_runtime directory's .c files, declared here so both the          */
 /* instrumented target and any standalone test/driver code can share one   */

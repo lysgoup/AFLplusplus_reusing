@@ -438,6 +438,286 @@ static u8 try_seed_cache(const char *work_dir, const char *seed_cache_dir,
 
 }
 
+/* ---------------------------------------------------------------------- */
+/* Magic-byte grouping -- ported from Angora's own                         */
+/* fuzzer/src/track/fparser.rs (is_magic_byte_cmp() lives in                */
+/* common/src/cond_stmt_base.rs, group_adjacent_one_byte_magic_bytes() in   */
+/* fparser.rs itself). Runs once per completed dtaint execution, right     */
+/* after the run finishes, transcoding the runtime's raw v2 scratch file   */
+/* into this tool's own v3 output format (include/dtaint.h) before it's    */
+/* persisted or cached: a multi-byte magic constant that the compiler      */
+/* split into several per-byte icmp comparisons (or an unrolled            */
+/* memcmp/strcmp) shouldn't look like N independent 1-byte constraints to  */
+/* anything consuming this file downstream.                                */
+/* ---------------------------------------------------------------------- */
+
+#define WORKER_ICMP_EQ 32U
+#define WORKER_ICMP_NE 33U
+#define WORKER_OP_BASIC_MASK 0xFFU
+
+/* Mirrors CondStmtBase::is_magic_byte_cmp() exactly: either a
+   strcmp/memcmp-family call (always magic-byte), or a plain equality/
+   inequality compare where exactly one side is tainted (the other is a
+   fixed constant -- if both sides are tainted it's an input-vs-input
+   compare, not a constant check). */
+static u8 is_magic_byte_cmp(u32 op, u32 lb1, u32 lb2) {
+
+  if (op == DTAINT_COND_FN_OP) return 1;
+
+  u32 basic = op & WORKER_OP_BASIC_MASK;
+  if (basic != WORKER_ICMP_EQ && basic != WORKER_ICMP_NE) return 0;
+
+  return (lb1 > 0) != (lb2 > 0);
+
+}
+
+typedef struct {
+
+  u32                         label;
+  u32                         n_segs;
+  struct dtaint_tag_seg_wire *segs;
+
+} worker_tag_lookup_t;
+
+static int cmp_tag_lookup(const void *a, const void *b) {
+
+  u32 la = ((const worker_tag_lookup_t *)a)->label;
+  u32 lb = ((const worker_tag_lookup_t *)b)->label;
+  return (la > lb) - (la < lb);
+
+}
+
+static worker_tag_lookup_t *find_tag(worker_tag_lookup_t *tags, u32 n_tags, u32 label) {
+
+  if (!label || !n_tags) return NULL;
+  worker_tag_lookup_t key = { .label = label, .n_segs = 0, .segs = NULL };
+  return bsearch(&key, tags, n_tags, sizeof(worker_tag_lookup_t), cmp_tag_lookup);
+
+}
+
+/* Mirrors fparser.rs::get_offsets_and_variables()'s side-selection rule:
+   prefer whichever of lb1/lb2 resolves to fewer taint segments (simpler,
+   more specific provenance), falling back to lb1 if lb2 has none at all.
+   Returns NULL if neither side has any segments. */
+static worker_tag_lookup_t *pick_primary_side(worker_tag_lookup_t *tags, u32 n_tags,
+                                              u32 lb1, u32 lb2) {
+
+  worker_tag_lookup_t *t1 = find_tag(tags, n_tags, lb1);
+  worker_tag_lookup_t *t2 = find_tag(tags, n_tags, lb2);
+
+  if (!t2 || !t2->n_segs) return t1;
+  if (t1 && t1->n_segs && t1->n_segs <= t2->n_segs) return t1;
+  return t2;
+
+}
+
+typedef struct {
+
+  u32 idx;      /* index into the file's cond_list */
+  u32 context;
+  u32 begin;
+  u32 end;
+  u8  is_fn;
+
+} magic_candidate_t;
+
+static int cmp_magic_candidate(const void *a, const void *b) {
+
+  const magic_candidate_t *ca = a, *cb = b;
+  if (ca->context != cb->context)
+    return (ca->context > cb->context) - (ca->context < cb->context);
+  return (ca->begin > cb->begin) - (ca->begin < cb->begin);
+
+}
+
+/* Reads a raw v2 scratch file written by dfsan_legacy's runtime, computes
+   magic-byte groups, and writes the augmented v3 file to dest_path.
+   Returns 0 on success, 1 if the input wasn't recognized as a plain v2
+   file (caller should fall back to a plain rename instead of losing the
+   run's output), -1 on a real I/O error. Never touches scratch_path
+   itself -- the caller decides whether to unlink or keep it. */
+static int transcode_dtaint_with_magic_groups(const char *scratch_path,
+                                              const char *dest_path) {
+
+  s32 fd = open(scratch_path, O_RDONLY);
+  if (fd < 0) return -1;
+
+  struct stat st;
+  if (fstat(fd, &st)) { close(fd); return -1; }
+
+  u32 raw_len = (u32)st.st_size;
+  u8 *raw = ck_alloc(raw_len ? raw_len : 1);
+  ssize_t rd = read(fd, raw, raw_len);
+  close(fd);
+
+  if (rd != (ssize_t)raw_len || raw_len < sizeof(struct dtaint_file_header)) {
+
+    ck_free(raw);
+    return -1;
+
+  }
+
+  struct dtaint_file_header hdr;
+  memcpy(&hdr, raw, sizeof(hdr));
+
+  if (hdr.magic != DTAINT_FILE_MAGIC || hdr.version != DTAINT_FILE_VERSION) {
+
+    /* Always a freshly written runtime scratch file in practice -- if it
+       ever isn't, don't lose the run's output over it, just skip grouping. */
+    ck_free(raw);
+    return 1;
+
+  }
+
+  u64 need = (u64)sizeof(hdr) + (u64)hdr.n_conds * sizeof(struct dtaint_cond_record);
+  if (need > raw_len) { ck_free(raw); return 1; }
+
+  u32 off = sizeof(hdr);
+  struct dtaint_cond_record *conds = (struct dtaint_cond_record *)(raw + off);
+  off += hdr.n_conds * sizeof(struct dtaint_cond_record);
+
+  u32 tags_section_off = off;
+  worker_tag_lookup_t *tags =
+      hdr.n_tags ? ck_alloc(hdr.n_tags * sizeof(worker_tag_lookup_t)) : NULL;
+
+  for (u32 i = 0; i < hdr.n_tags; i++) {
+
+    if (off + sizeof(struct dtaint_tag_record) > raw_len) { ck_free(raw); ck_free(tags); return 1; }
+
+    struct dtaint_tag_record rec;
+    memcpy(&rec, raw + off, sizeof(rec));
+    off += sizeof(rec);
+
+    if ((u64)off + (u64)rec.n_segs * sizeof(struct dtaint_tag_seg_wire) > raw_len) {
+
+      ck_free(raw);
+      ck_free(tags);
+      return 1;
+
+    }
+
+    tags[i].label = rec.label;
+    tags[i].n_segs = rec.n_segs;
+    tags[i].segs = (struct dtaint_tag_seg_wire *)(raw + off);
+    off += rec.n_segs * sizeof(struct dtaint_tag_seg_wire);
+
+  }
+
+  if (hdr.n_tags) qsort(tags, hdr.n_tags, sizeof(worker_tag_lookup_t), cmp_tag_lookup);
+
+  /* --- find every single-byte magic-byte comparison --- */
+
+  magic_candidate_t *cand =
+      hdr.n_conds ? ck_alloc(hdr.n_conds * sizeof(magic_candidate_t)) : NULL;
+  u32 n_cand = 0;
+
+  for (u32 i = 0; i < hdr.n_conds; i++) {
+
+    if (!is_magic_byte_cmp(conds[i].op, conds[i].lb1, conds[i].lb2)) continue;
+
+    worker_tag_lookup_t *primary =
+        pick_primary_side(tags, hdr.n_tags, conds[i].lb1, conds[i].lb2);
+    if (!primary || primary->n_segs != 1) continue;
+    if (primary->segs[0].end - primary->segs[0].begin != 1) continue;
+
+    cand[n_cand].idx = i;
+    cand[n_cand].context = conds[i].context;
+    cand[n_cand].begin = primary->segs[0].begin;
+    cand[n_cand].end = primary->segs[0].end;
+    cand[n_cand].is_fn = conds[i].op == DTAINT_COND_FN_OP;
+    n_cand++;
+
+  }
+
+  if (n_cand) qsort(cand, n_cand, sizeof(magic_candidate_t), cmp_magic_candidate);
+
+  /* group_begin[i]/group_end[i] stay 0/0 (ck_alloc zeroes) for any cond
+     record not part of a multi-member group. */
+  u32 *group_begin = hdr.n_conds ? ck_alloc(hdr.n_conds * sizeof(u32)) : NULL;
+  u32 *group_end   = hdr.n_conds ? ck_alloc(hdr.n_conds * sizeof(u32)) : NULL;
+
+  u32 k = 0;
+  while (k < n_cand) {
+
+    u32 j = k;
+    while (j + 1 < n_cand &&
+           cand[j].is_fn == cand[j + 1].is_fn &&
+           cand[j].context == cand[j + 1].context &&
+           cand[j + 1].begin == cand[j].end) {
+
+      j++;
+
+    }
+
+    if (j > k) {
+
+      u32 span_begin = cand[k].begin, span_end = cand[j].end;
+      for (u32 m = k; m <= j; m++) {
+
+        group_begin[cand[m].idx] = span_begin;
+        group_end[cand[m].idx] = span_end;
+
+      }
+
+    }
+
+    k = j + 1;
+
+  }
+
+  if (cand) ck_free(cand);
+
+  /* --- write the augmented v3 file --- */
+
+  FILE *out = fopen(dest_path, "wb");
+  if (!out) {
+
+    if (tags) ck_free(tags);
+    if (group_begin) ck_free(group_begin);
+    if (group_end) ck_free(group_end);
+    ck_free(raw);
+    return -1;
+
+  }
+
+  struct dtaint_file_header out_hdr = hdr;
+  out_hdr.version = DTAINT_FILE_VERSION_GROUPED;
+  fwrite(&out_hdr, sizeof(out_hdr), 1, out);
+
+  for (u32 i = 0; i < hdr.n_conds; i++) {
+
+    struct dtaint_cond_record_grouped g = {
+
+        .cmpid = conds[i].cmpid, .context = conds[i].context,
+        .order = conds[i].order, .belong = conds[i].belong,
+        .condition = conds[i].condition, .level = conds[i].level,
+        .op = conds[i].op, .size = conds[i].size,
+        .lb1 = conds[i].lb1, .lb2 = conds[i].lb2,
+        .arg1 = conds[i].arg1, .arg2 = conds[i].arg2,
+        .magic_group_begin = group_begin[i], .magic_group_end = group_end[i],
+
+    };
+
+    fwrite(&g, sizeof(g), 1, out);
+
+  }
+
+  /* tags + magic_bytes sections are byte-identical to the raw file --
+     everything from tags_section_off to EOF, verbatim, in one shot. */
+  if (raw_len > tags_section_off)
+    fwrite(raw + tags_section_off, 1, raw_len - tags_section_off, out);
+
+  fclose(out);
+
+  if (tags) ck_free(tags);
+  if (group_begin) ck_free(group_begin);
+  if (group_end) ck_free(group_end);
+  ck_free(raw);
+
+  return 0;
+
+}
+
 /* Runs one input through the dtaint forkserver and, if it produced a track
    file, files it away under work_dir as "<fname>.dtaint". Serves three
    callers with the same logic: live queue entries (src_dir = queue_dir,
@@ -582,15 +862,28 @@ static void process_queue_entry(afl_forkserver_t *fsrv, const char *src_dir,
   if (access((char *)scratch_path, F_OK) == 0) {
 
     u8 *dest_path = alloc_printf("%s/%s.dtaint", work_dir, fname);
+    int tc = transcode_dtaint_with_magic_groups((char *)scratch_path, (char *)dest_path);
 
-    if (rename((char *)scratch_path, (char *)dest_path)) {
+    if (tc == 0) {
 
-      WARNF("Could not rename dtaint scratch file to '%s': %s", dest_path,
-            strerror(errno));
+      unlink((char *)scratch_path);
+      if (!quiet_mode) { OKF("dtaint: %s -> %s", fname, dest_path); }
 
-    } else if (!quiet_mode) {
+    } else {
 
-      OKF("dtaint: %s -> %s", fname, dest_path);
+      /* Transcode failed, or the scratch file wasn't the plain v2 format
+         it's always expected to be -- fall back to the old plain rename
+         rather than lose the run's output over a grouping bug. */
+      if (rename((char *)scratch_path, (char *)dest_path)) {
+
+        WARNF("Could not rename dtaint scratch file to '%s': %s", dest_path,
+              strerror(errno));
+
+      } else if (!quiet_mode) {
+
+        OKF("dtaint: %s -> %s (ungrouped)", fname, dest_path);
+
+      }
 
     }
 
