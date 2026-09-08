@@ -212,6 +212,27 @@ static void usage(u8 *argv0) {
       "                  (default: none)\n"
       "  -p sec        - live mode: queue poll interval in seconds "
       "(default: 2)\n"
+      "  -D dict_path  - accumulate tainted values behind a NEW comparison "
+      "outcome\n"
+      "                  (a (site, context, condition) combo never seen "
+      "before in\n"
+      "                  this run) across the whole run (both modes), and "
+      "write\n"
+      "                  it out once the run ends. Every line is a JSON-"
+      "style\n"
+      "                  array of quoted, \\xNN-escaped byte strings -- "
+      "[\"...\"]\n"
+      "                  for a magic-byte chain (see above) or a single-"
+      "segment\n"
+      "                  value, [\"...\",\"...\"] for a multi-segment "
+      "taint label\n"
+      "                  (each element one segment, in order). NOT AFL++ "
+      "-x\n"
+      "                  syntax -- meant for a downstream reader of this "
+      "tool's\n"
+      "                  own. Anything shorter than 2 bytes is dropped "
+      "unless\n"
+      "                  it's part of a multi-segment label.\n"
       "  -Q            - quiet mode\n\n"
 
       "Use '@@' in the target command line to have it substituted with the "
@@ -439,6 +460,289 @@ static u8 try_seed_cache(const char *work_dir, const char *seed_cache_dir,
 }
 
 /* ---------------------------------------------------------------------- */
+/* Interesting-value dictionary -- accumulated across every execution for  */
+/* the life of the process (both -S batch mode and a live campaign),       */
+/* written out once at exit via -D. A value is collected from ANY tainted  */
+/* comparison, any op, whichever way it came out, the first time its       */
+/* (cmpid, context, condition) combination is ever seen (see               */
+/* novelty_check_and_mark() below) -- not gated on "matched" a constant.    */
+/* Every output line is a JSON-style array of quoted, \xNN-escaped byte    */
+/* strings: one element for a magic-byte chain or single-segment value,    */
+/* one element per segment (in order) for a multi-segment taint label.     */
+/* Not AFL++ dictionary syntax (see src/afl-fuzz-extras.c's                */
+/* load_extras_file() for that format) -- meant for a downstream reader    */
+/* of this tool's own that cares about per-segment structure.              */
+/* ---------------------------------------------------------------------- */
+
+#define WORKER_DICT_MAX_ENTRIES 10000
+#define WORKER_DICT_MAX_ENTRY_LEN 32
+
+typedef struct {
+
+  u8 *data;
+  u32 len;
+
+} dict_entry_t;
+
+/* One segment of a multi-segment taint label, kept distinct rather than
+   concatenated: group_id ties every segment of the same label together.
+   Entries sharing a group_id are always added contiguously (one
+   dict_add_group() call writes a whole group before the next one starts),
+   so dict_write() can render each run as a single `["...","..."]` line --
+   not AFL dictionary syntax at all, meant purely for a downstream reader
+   that cares which segments belonged to the same original taint label. */
+typedef struct {
+
+  u32 group_id;
+  u8 *data;
+  u32 len;
+
+} group_entry_t;
+
+typedef struct {
+
+  dict_entry_t *entries;
+  u32           count;
+  u32           cap;
+
+  group_entry_t *groups;
+  u32            groups_count;
+  u32            groups_cap;
+  u32            next_group_id;
+
+} worker_dict_t;
+
+static void dict_init(worker_dict_t *d) {
+
+  d->entries = NULL;
+  d->count = 0;
+  d->cap = 0;
+
+  d->groups = NULL;
+  d->groups_count = 0;
+  d->groups_cap = 0;
+  d->next_group_id = 0;
+
+}
+
+/* Dedup domain for plain standalone entries only -- group membership is a
+   separate dedup domain (see dict_group_exists()), so a value already
+   sitting inside a group doesn't block it from also being recorded as its
+   own standalone entry, and vice versa. */
+static u8 dict_contains(worker_dict_t *d, const u8 *data, u32 len) {
+
+  for (u32 i = 0; i < d->count; i++) {
+
+    if (d->entries[i].len == len && !memcmp(d->entries[i].data, data, len)) return 1;
+
+  }
+
+  return 0;
+
+}
+
+/* No-op if data/len is empty, absurdly long for a magic constant (32+
+   bytes strongly suggests a mis-grouped run, not a real fixed value), the
+   dict is disabled (d == NULL, -D not given), the global cap is already
+   hit, or this exact value is already in the set. */
+static void dict_add(worker_dict_t *d, const u8 *data, u32 len) {
+
+  if (!d || !data || !len || len > WORKER_DICT_MAX_ENTRY_LEN) return;
+  if (d->count >= WORKER_DICT_MAX_ENTRIES) return;
+  if (dict_contains(d, data, len)) return;
+
+  if (d->count == d->cap) {
+
+    d->cap = d->cap ? d->cap * 2 : 64;
+    d->entries = ck_realloc(d->entries, d->cap * sizeof(dict_entry_t));
+
+  }
+
+  d->entries[d->count].data = ck_alloc(len);
+  memcpy(d->entries[d->count].data, data, len);
+  d->entries[d->count].len = len;
+  d->count++;
+
+}
+
+/* Whole-group dedup: does an already-stored group consist of exactly
+   these same n_segs segment values, in the same order? Partial matches
+   don't count -- the group's identity is the complete ordered set, not
+   any individual member. */
+static u8 dict_group_exists(worker_dict_t *d, struct dtaint_tag_seg_wire *segs, u32 n_segs,
+                            const u8 *orig_input, u32 orig_input_len) {
+
+  u32 i = 0;
+
+  while (i < d->groups_count) {
+
+    u32 gid = d->groups[i].group_id;
+    u32 start = i;
+
+    while (i < d->groups_count && d->groups[i].group_id == gid) i++;
+
+    if (i - start != n_segs) continue;
+
+    u8 all_match = 1;
+
+    for (u32 s = 0; s < n_segs && all_match; s++) {
+
+      u32 b = segs[s].begin, e = segs[s].end;
+      if (e > orig_input_len || d->groups[start + s].len != e - b ||
+          memcmp(d->groups[start + s].data, orig_input + b, e - b)) {
+
+        all_match = 0;
+
+      }
+
+    }
+
+    if (all_match) return 1;
+
+  }
+
+  return 0;
+
+}
+
+/* Records every segment of a multi-segment taint label under a fresh
+   shared group_id, so a downstream reader can later reconstruct "these N
+   byte ranges came from the same label". Unlike dict_add(), a group is
+   never partially stored: either every segment passes the bounds/size
+   sanity check and the whole group is new (dict_group_exists() says no),
+   in which case all n_segs segments go in together, or nothing does.
+   No-op for a single-segment label (nothing to distinguish) or a
+   pathologically wide one (a label combine()d from dozens of segments is
+   almost certainly the MAX_COND_ORDER-style saturation case, not a
+   meaningful structured value). */
+static void dict_add_group(worker_dict_t *d, struct dtaint_tag_seg_wire *segs, u32 n_segs,
+                           const u8 *orig_input, u32 orig_input_len) {
+
+  if (!d || !segs || n_segs < 2 || n_segs > 64) return;
+
+  for (u32 s = 0; s < n_segs; s++) {
+
+    u32 b = segs[s].begin, e = segs[s].end;
+    if (e <= b || e > orig_input_len || (e - b) > WORKER_DICT_MAX_ENTRY_LEN) return;
+
+  }
+
+  if (dict_group_exists(d, segs, n_segs, orig_input, orig_input_len)) return;
+  if (d->groups_count + n_segs > WORKER_DICT_MAX_ENTRIES) return;
+
+  u32 gid = d->next_group_id++;
+
+  for (u32 s = 0; s < n_segs; s++) {
+
+    u32 b = segs[s].begin, e = segs[s].end;
+
+    if (d->groups_count == d->groups_cap) {
+
+      d->groups_cap = d->groups_cap ? d->groups_cap * 2 : 64;
+      d->groups = ck_realloc(d->groups, d->groups_cap * sizeof(group_entry_t));
+
+    }
+
+    d->groups[d->groups_count].group_id = gid;
+    d->groups[d->groups_count].data = ck_alloc(e - b);
+    memcpy(d->groups[d->groups_count].data, orig_input + b, e - b);
+    d->groups[d->groups_count].len = e - b;
+    d->groups_count++;
+
+  }
+
+}
+
+/* AFL++ dictionary line escaping (mirrors load_extras_file()'s reader
+   exactly, in reverse): printable ASCII passes through as-is; '\\' and
+   '"' get backslash-escaped; everything else (including any embedded NUL,
+   which a plain fgets()-based reader could never see past otherwise)
+   becomes \xNN. */
+static void dict_write_escaped(FILE *f, const u8 *data, u32 len) {
+
+  for (u32 i = 0; i < len; i++) {
+
+    u8 c = data[i];
+
+    if (c == '\\' || c == '"') {
+
+      fputc('\\', f);
+      fputc(c, f);
+
+    } else if (c >= 32 && c < 127) {
+
+      fputc(c, f);
+
+    } else {
+
+      fprintf(f, "\\x%02x", c);
+
+    }
+
+  }
+
+}
+
+static void dict_write(worker_dict_t *d, const char *path) {
+
+  if (!d || (!d->count && !d->groups_count)) return;
+
+  FILE *f = fopen(path, "w");
+  if (!f) {
+
+    WARNF("Could not open '%s' for writing dictionary: %s", path, strerror(errno));
+    return;
+
+  }
+
+  fprintf(f, "# extracted by reusing-taint-worker -- %u entries, %u grouped segments\n",
+          d->count, d->groups_count);
+
+  for (u32 i = 0; i < d->count; i++) {
+
+    fputc('[', f);
+    fputc('"', f);
+    dict_write_escaped(f, d->entries[i].data, d->entries[i].len);
+    fputs("\"]\n", f);
+
+  }
+
+  /* Entries sharing a group_id are always contiguous (see dict_add_group()),
+     so each run renders as one ["...","...",...] line. */
+  u32 gi = 0;
+  while (gi < d->groups_count) {
+
+    u32 gid = d->groups[gi].group_id;
+    fputc('[', f);
+
+    u8 first = 1;
+    while (gi < d->groups_count && d->groups[gi].group_id == gid) {
+
+      if (!first) fputc(',', f);
+      first = 0;
+      fputc('"', f);
+      dict_write_escaped(f, d->groups[gi].data, d->groups[gi].len);
+      fputc('"', f);
+      gi++;
+
+    }
+
+    fputs("]\n", f);
+
+  }
+
+  fclose(f);
+
+  if (!quiet_mode) {
+
+    OKF("Wrote %u dictionary entries (%u grouped segments) to '%s'.",
+        d->count, d->groups_count, path);
+
+  }
+
+}
+
+/* ---------------------------------------------------------------------- */
 /* Magic-byte grouping -- ported from Angora's own                         */
 /* fuzzer/src/track/fparser.rs (is_magic_byte_cmp() lives in                */
 /* common/src/cond_stmt_base.rs, group_adjacent_one_byte_magic_bytes() in   */
@@ -468,6 +772,121 @@ static u8 is_magic_byte_cmp(u32 op, u32 lb1, u32 lb2) {
   if (basic != WORKER_ICMP_EQ && basic != WORKER_ICMP_NE) return 0;
 
   return (lb1 > 0) != (lb2 > 0);
+
+}
+
+/* Tracks, for the whole lifetime of the process (every input from every
+   file this worker ever runs, live campaign or -S batch alike), which
+   (cmpid, context, condition) outcomes have already been seen. A
+   comparison site normally settles into one steady outcome once fuzzing
+   converges on valid-ish inputs; the *first* time a given site+context
+   produces a condition value that's never come up before -- true after
+   nothing but false, a new switch-case branch, whatever -- that's a
+   concrete sign this input made the site do something the corpus hasn't
+   shown before, independent of which side "won". Open-addressing hash set
+   with linear probing, since this can grow into the tens of thousands of
+   distinct (site, context, outcome) triples over a long campaign. */
+
+#define NOVELTY_INITIAL_CAP 4096
+
+typedef struct {
+
+  u32 cmpid;
+  u32 context;
+  u32 condition;
+  u8  used;
+
+} novelty_slot_t;
+
+typedef struct {
+
+  novelty_slot_t *slots;
+  u32             cap;
+  u32             count;
+
+} novelty_set_t;
+
+static void novelty_init(novelty_set_t *s) {
+
+  s->cap = NOVELTY_INITIAL_CAP;
+  s->slots = ck_alloc(s->cap * sizeof(novelty_slot_t));
+  s->count = 0;
+
+}
+
+static u32 novelty_hash(u32 cmpid, u32 context, u32 condition) {
+
+  u32 h = cmpid;
+  h = h * 2654435761u ^ context;
+  h = h * 2654435761u ^ condition;
+  return h;
+
+}
+
+/* Raw insert, no duplicate check -- only ever called on keys already
+   confirmed absent (a fresh table during grow, or right after
+   novelty_check_and_mark's own probe already proved this key isn't
+   there). */
+static void novelty_raw_insert(novelty_set_t *s, u32 cmpid, u32 context, u32 condition) {
+
+  u32 idx = novelty_hash(cmpid, context, condition) % s->cap;
+
+  while (s->slots[idx].used) idx = (idx + 1) % s->cap;
+
+  s->slots[idx].used = 1;
+  s->slots[idx].cmpid = cmpid;
+  s->slots[idx].context = context;
+  s->slots[idx].condition = condition;
+  s->count++;
+
+}
+
+static void novelty_grow(novelty_set_t *s) {
+
+  novelty_slot_t *old_slots = s->slots;
+  u32             old_cap = s->cap;
+
+  s->cap *= 2;
+  s->slots = ck_alloc(s->cap * sizeof(novelty_slot_t));
+  s->count = 0;
+
+  for (u32 i = 0; i < old_cap; i++) {
+
+    if (old_slots[i].used) {
+
+      novelty_raw_insert(s, old_slots[i].cmpid, old_slots[i].context, old_slots[i].condition);
+
+    }
+
+  }
+
+  ck_free(old_slots);
+
+}
+
+/* Returns 1 (and marks it seen) the first time this exact (cmpid, context,
+   condition) triple is encountered; 0 every time after. */
+static u8 novelty_check_and_mark(novelty_set_t *s, u32 cmpid, u32 context, u32 condition) {
+
+  if ((u64)(s->count + 1) * 4 >= (u64)s->cap * 3) novelty_grow(s);
+
+  u32 idx = novelty_hash(cmpid, context, condition) % s->cap;
+
+  while (s->slots[idx].used) {
+
+    if (s->slots[idx].cmpid == cmpid && s->slots[idx].context == context &&
+        s->slots[idx].condition == condition) {
+
+      return 0;
+
+    }
+
+    idx = (idx + 1) % s->cap;
+
+  }
+
+  novelty_raw_insert(s, cmpid, context, condition);
+  return 1;
 
 }
 
@@ -535,9 +954,18 @@ static int cmp_magic_candidate(const void *a, const void *b) {
    Returns 0 on success, 1 if the input wasn't recognized as a plain v2
    file (caller should fall back to a plain rename instead of losing the
    run's output), -1 on a real I/O error. Never touches scratch_path
-   itself -- the caller decides whether to unlink or keep it. */
+   itself -- the caller decides whether to unlink or keep it.
+
+   orig_input/orig_input_len is the exact buffer this run was fed (NULL/0
+   to skip dictionary extraction entirely, e.g. if -D wasn't given); dict
+   and novelty together drive that extraction (see the unified pass
+   further down), both NULL to disable it. */
 static int transcode_dtaint_with_magic_groups(const char *scratch_path,
-                                              const char *dest_path) {
+                                              const char *dest_path,
+                                              const u8 *orig_input,
+                                              u32 orig_input_len,
+                                              worker_dict_t *dict,
+                                              novelty_set_t *novelty) {
 
   s32 fd = open(scratch_path, O_RDONLY);
   if (fd < 0) return -1;
@@ -605,7 +1033,10 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
 
   if (hdr.n_tags) qsort(tags, hdr.n_tags, sizeof(worker_tag_lookup_t), cmp_tag_lookup);
 
-  /* --- find every single-byte magic-byte comparison --- */
+  /* --- find every single-byte magic-byte comparison, for the grouping
+     pass below (this is purely a v3-format concern: gluing an unrolled
+     multi-byte constant check back into one span -- see the top-of-file
+     comment on DTAINT_FILE_VERSION_GROUPED). --- */
 
   magic_candidate_t *cand =
       hdr.n_conds ? ck_alloc(hdr.n_conds * sizeof(magic_candidate_t)) : NULL;
@@ -666,6 +1097,61 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
   }
 
   if (cand) ck_free(cand);
+
+  /* --- interesting-value extraction: for every tainted comparison,
+     regardless of op or outcome, that produced a (cmpid, context,
+     condition) combination never seen before in this process's lifetime,
+     record its tainted bytes. A grouped byte-chain (see above) becomes
+     one combined value, since it's already established as one genuinely
+     contiguous span. Otherwise this uses whichever of lb1/lb2 is the
+     "primary" side (see pick_primary_side()): a single-segment tag stores
+     that one span (dropped if it's only 1 byte -- rarely meaningful
+     alone); a multi-segment tag stores each segment on its own (same
+     1-byte drop, applied per segment) *and*, separately, every segment of
+     that same label under one shared group_id (see dict_add_group()) so
+     which segments co-occurred in the same label stays recoverable even
+     though they're never concatenated into a single blob. */
+
+  for (u32 i = 0; dict && novelty && orig_input && i < hdr.n_conds; i++) {
+
+    if (!conds[i].lb1 && !conds[i].lb2) continue;
+    if (!novelty_check_and_mark(novelty, conds[i].cmpid, conds[i].context, conds[i].condition)) {
+
+      continue;
+
+    }
+
+    if (group_end[i] > group_begin[i]) {
+
+      if (group_end[i] <= orig_input_len) {
+
+        dict_add(dict, orig_input + group_begin[i], group_end[i] - group_begin[i]);
+
+      }
+
+      continue;
+
+    }
+
+    worker_tag_lookup_t *primary =
+        pick_primary_side(tags, hdr.n_tags, conds[i].lb1, conds[i].lb2);
+    if (!primary || !primary->n_segs) continue;
+
+    if (primary->n_segs > 1) {
+
+      dict_add_group(dict, primary->segs, primary->n_segs, orig_input, orig_input_len);
+
+    }
+
+    for (u32 s = 0; s < primary->n_segs; s++) {
+
+      u32 b = primary->segs[s].begin, e = primary->segs[s].end;
+      if (e - b <= 1 || e > orig_input_len) continue;
+      dict_add(dict, orig_input + b, e - b);
+
+    }
+
+  }
 
   /* --- write the augmented v3 file --- */
 
@@ -752,6 +1238,8 @@ static void process_queue_entry(afl_forkserver_t *fsrv, const char *src_dir,
                                 const char *work_dir,
                                 const char *seed_cache_dir,
                                 const char *input_seed_dir,
+                                worker_dict_t *dict,
+                                novelty_set_t *novelty,
                                 const char *fname) {
 
   u8 *orig_name = extract_orig_name(fname);
@@ -862,7 +1350,8 @@ static void process_queue_entry(afl_forkserver_t *fsrv, const char *src_dir,
   if (access((char *)scratch_path, F_OK) == 0) {
 
     u8 *dest_path = alloc_printf("%s/%s.dtaint", work_dir, fname);
-    int tc = transcode_dtaint_with_magic_groups((char *)scratch_path, (char *)dest_path);
+    int tc = transcode_dtaint_with_magic_groups((char *)scratch_path, (char *)dest_path,
+                                                buf, len, dict, novelty);
 
     if (tc == 0) {
 
@@ -904,7 +1393,8 @@ static void process_queue_entry(afl_forkserver_t *fsrv, const char *src_dir,
    process_queue_entry()'s cache-hit check is simply a no-op here, it just
    runs the forkserver on every file and files away whatever comes out. */
 static void run_seed_scan(afl_forkserver_t *fsrv, const char *seed_dir,
-                          const char *out_dir) {
+                          const char *out_dir, worker_dict_t *dict,
+                          novelty_set_t *novelty) {
 
   DIR *d = opendir(seed_dir);
   if (!d) { PFATAL("Unable to open seed dir '%s'", seed_dir); }
@@ -922,7 +1412,7 @@ static void run_seed_scan(afl_forkserver_t *fsrv, const char *seed_dir,
 #endif
     if (de->d_name[0] == '.') continue;
 
-    process_queue_entry(fsrv, seed_dir, out_dir, NULL, NULL, de->d_name);
+    process_queue_entry(fsrv, seed_dir, out_dir, NULL, NULL, dict, novelty, de->d_name);
     ++n;
 
   }
@@ -946,6 +1436,7 @@ int main(int argc, char **argv_orig, char **envp) {
   u8  *seed_scan_dir = NULL;
   u8  *seed_cache_dir = NULL;
   u8  *input_seed_dir = NULL;
+  u8  *dict_out_path = NULL;
   u32  exec_tmout = 5000;
   u64  mem_limit = 0;
   u32  poll_interval_sec = 2;
@@ -954,7 +1445,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
   if (getenv("AFL_QUIET") != NULL) { quiet_mode = 1; }
 
-  while ((opt = getopt(argc, argv, "+o:S:c:i:t:m:p:Qh")) > 0) {
+  while ((opt = getopt(argc, argv, "+o:S:c:i:t:m:p:D:Qh")) > 0) {
 
     switch (opt) {
 
@@ -980,6 +1471,15 @@ int main(int argc, char **argv_orig, char **envp) {
            filename (see process_queue_entry()'s is_known_seed check). */
         if (input_seed_dir) { FATAL("Multiple -i options not supported"); }
         input_seed_dir = (u8 *)optarg;
+        break;
+
+      case 'D':
+        /* Where to write the extracted magic-byte-value dictionary at
+           exit (AFL++ -x format). Works in either mode: accumulates
+           across the whole -S batch, or across a live campaign's full
+           lifetime, and is written once, when the run actually ends. */
+        if (dict_out_path) { FATAL("Multiple -D options not supported"); }
+        dict_out_path = (u8 *)optarg;
         break;
 
       case 't':
@@ -1038,6 +1538,20 @@ int main(int argc, char **argv_orig, char **envp) {
 
     FATAL("-i is live-mode only -- -S already takes the seed dir directly "
           "as its argument.");
+
+  }
+
+  worker_dict_t  dict_storage;
+  worker_dict_t *dict = NULL;
+  novelty_set_t  novelty_storage;
+  novelty_set_t *novelty = NULL;
+
+  if (dict_out_path) {
+
+    dict_init(&dict_storage);
+    dict = &dict_storage;
+    novelty_init(&novelty_storage);
+    novelty = &novelty_storage;
 
   }
 
@@ -1197,7 +1711,9 @@ int main(int argc, char **argv_orig, char **envp) {
 
     /* -S is a one-shot job: scan, then exit -- no queue/ to watch, no
        campaign this invocation is part of. */
-    if (!stop_soon) { run_seed_scan(fsrv, (char *)seed_scan_dir, (char *)work_dir); }
+    if (!stop_soon) { run_seed_scan(fsrv, (char *)seed_scan_dir, (char *)work_dir, dict, novelty); }
+
+    if (dict) dict_write(dict, (char *)dict_out_path);
 
     if (fsrv->out_fd >= 0 && !fsrv->use_stdin) { unlink((char *)stdin_file); }
     ck_free(stdin_file);
@@ -1226,7 +1742,7 @@ int main(int argc, char **argv_orig, char **envp) {
 
       process_queue_entry(fsrv, (char *)queue_dir, (char *)work_dir,
                           (char *)seed_cache_dir, (char *)input_seed_dir,
-                          (char *)entries[i].name);
+                          dict, novelty, (char *)entries[i].name);
       last_id = entries[i].id;
       free(entries[i].name);
 
@@ -1239,6 +1755,8 @@ int main(int argc, char **argv_orig, char **envp) {
   }
 
   if (!quiet_mode) { OKF("Stopping."); }
+
+  if (dict) dict_write(dict, (char *)dict_out_path);
 
   if (fsrv->out_fd >= 0 && !fsrv->use_stdin) { unlink((char *)stdin_file); }
   ck_free(stdin_file);
