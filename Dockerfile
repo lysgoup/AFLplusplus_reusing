@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 #
 # This Dockerfile for AFLplusplus uses Ubuntu 24.04 and
 # installs LLVM 19 for afl-clang-lto support.
@@ -77,7 +78,14 @@ RUN git clone --depth=1 https://github.com/AFLplusplus/cov-analysis && \
     (cd cov-analysis && make install) && rm -rf cov-analysis
 
 WORKDIR /AFLplusplus
-COPY . .
+# src/reusing-taint-worker.c is excluded here and copied in separately,
+# right before the step that actually builds it (after the expensive
+# make distrib/install above) -- same reasoning as dfsan_legacy's own
+# split further down: this file is the one still actively iterating,
+# and it doesn't participate in make distrib/install at all (a fully
+# standalone new binary, see GNUmakefile's own target), so there's no
+# reason a one-line change to it should invalidate that ~10 minute step.
+COPY --exclude=src/reusing-taint-worker.c . .
 
 ARG CC=gcc-$GCC_VERSION
 ARG CXX=g++-$GCC_VERSION
@@ -92,6 +100,70 @@ RUN sed -i.bak 's/^	-/	/g' GNUmakefile && \
     make clean && make distrib && \
     ([ "${TEST_BUILD}" ] || (make install)) && \
     mv GNUmakefile.bak GNUmakefile
+
+# reusing-taint-worker: standalone, links only against the generic
+# forkserver .o's (see GNUmakefile's own target comment) -- built and
+# installed here so it ships in the same base image as afl-fuzz. Copied in
+# separately (excluded from the main COPY . . above) so iterating on it
+# doesn't invalidate the make distrib/install layer above.
+COPY src/reusing-taint-worker.c src/reusing-taint-worker.c
+RUN make reusing-taint-worker && install -m 755 reusing-taint-worker /usr/local/bin/
+
+# --- Real DFSan (Angora-parity) dynamic taint tracking ---------------------
+# See dfsan_legacy/README.md for the full rationale and verification notes:
+# modern LLVM's own DFSan (the LLVM_VERSION installed above) cannot give
+# per-input-byte provenance (its label is an 8-bit bitmask), so this vendors
+# Angora's actual LLVM 11.1.0 DataFlowSanitizer fork as a second, separate
+# toolchain used only to build AFL_DTAINT_BINARY companion binaries via
+# dfsan_legacy/angora_dfsan_clang.sh -- it never touches the main AFL++
+# build above. Ported over from real-dfsan-vendor (this branch's afl-fuzz.c
+# itself does NOT read AFL_DTAINT_BINARY -- see that branch instead for the
+# in-process consumer; this base image just needs the toolchain present so
+# aflplusplus-reusing-target/Dockerfile's dtaint stage can produce binaries
+# and cmpid_locs.txt logs, whether or not anything in this process ever
+# reads AFL_DTAINT_BINARY itself).
+RUN wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-11.1.0/clang+llvm-11.1.0-x86_64-linux-gnu-ubuntu-16.04.tar.xz -O /tmp/llvm11.tar.xz && \
+    mkdir -p /opt && tar -xf /tmp/llvm11.tar.xz -C /opt && \
+    mv /opt/clang+llvm-11.1.0-x86_64-linux-gnu-ubuntu-16.04 /opt/clang+llvm-11 && \
+    rm /tmp/llvm11.tar.xz
+
+ENV DFSAN_LEGACY_LLVM_DIR=/opt/clang+llvm-11
+
+# The three vendored passes (verified to compile against this exact LLVM
+# release with zero source changes).
+RUN cd /AFLplusplus/dfsan_legacy && mkdir -p build_pass build_rt && \
+    for p in UnfoldBranchPass AngoraPass DFSanPass; do \
+      /opt/clang+llvm-11/bin/clang++ $(/opt/clang+llvm-11/bin/llvm-config --cxxflags) -fno-rtti -fpic -shared \
+        -I include -DLLVM_VERSION_MAJOR=11 -DLLVM_VERSION_MINOR=1 -DMAP_SIZE_POW2=23 \
+        -Wl,-znodelete "pass/${p}.cc" -o "build_pass/lib${p}.so" $(/opt/clang+llvm-11/bin/llvm-config --ldflags); \
+    done
+
+# dfsan_rt (the vendored compiler-rt DFSan runtime, with dfsan.cc's label
+# storage redirected to dtaint_runtime/dtaint_tagset.c) via its own CMake.
+RUN cd /AFLplusplus/dfsan_legacy && mkdir -p build && cd build && \
+    cmake -DCMAKE_C_COMPILER=/opt/clang+llvm-11/bin/clang \
+          -DCMAKE_CXX_COMPILER=/opt/clang+llvm-11/bin/clang++ \
+          -DCMAKE_INSTALL_PREFIX=/AFLplusplus/dfsan_legacy/install .. && \
+    make -j"$(nproc)"
+
+# Our own C runtime pieces, Angora's io_func.c (ABI-list source functions),
+# the comparison-tracing hooks, and AFL's own forkserver stub (needed so a
+# dtaint binary can participate in AFL_DTAINT_BINARY's forkserver protocol
+# at all -- it isn't compiled via afl-cc.c, so nothing else provides one).
+RUN cd /AFLplusplus/dfsan_legacy && \
+    for f in dtaint_tagset dtaint_logger dtaint_len_label dtaint_heapmap; do \
+      /opt/clang+llvm-11/bin/clang -c -O2 -fPIC -I ../include -I ../dtaint_runtime \
+        "../dtaint_runtime/${f}.c" -o "build_rt/${f}.o"; \
+    done && \
+    /opt/clang+llvm-11/bin/clang -c -O2 -fPIC -I include -I ../include -I ../dtaint_runtime \
+      -I dfsan_rt -I dfsan_rt/dfsan runtime/io_func.c -o build_rt/io_func.o && \
+    /opt/clang+llvm-11/bin/clang -c -O2 -fPIC -I include -I ../include -I ../dtaint_runtime \
+      -I dfsan_rt -I dfsan_rt/dfsan runtime/dtaint_legacy_hooks.c -o build_rt/dtaint_legacy_hooks.o && \
+    /opt/clang+llvm-11/bin/clang -c -O2 -fPIC -I include -I ../include -I ../dtaint_runtime \
+      -I dfsan_rt -I dfsan_rt/dfsan runtime/dtaint_stdalloc.c -o build_rt/dtaint_stdalloc.o && \
+    /opt/clang+llvm-11/bin/llvm-ar rcs build_rt/libdtaint-legacy-rt.a build_rt/*.o && \
+    /opt/clang+llvm-11/bin/clang -c -O0 -fPIC -Wno-unused-result -I ../include -I ../instrumentation \
+      ../instrumentation/afl-compiler-rt.o.c -o build_rt/afl-compiler-rt-llvm11.o
 
 RUN echo "set encoding=utf-8" > /root/.vimrc && \
     echo ". /etc/bash_completion" >> ~/.bashrc && \
