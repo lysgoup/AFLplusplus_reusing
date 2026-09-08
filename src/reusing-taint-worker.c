@@ -493,7 +493,6 @@ static u8 try_seed_cache(const char *work_dir, const char *seed_cache_dir,
 /* of this tool's own that cares about per-segment structure.              */
 /* ---------------------------------------------------------------------- */
 
-#define WORKER_DICT_MAX_ENTRIES 10000
 #define WORKER_DICT_MAX_ENTRY_LEN 32
 
 typedef struct {
@@ -561,12 +560,13 @@ static u8 dict_contains(worker_dict_t *d, const u8 *data, u32 len) {
 }
 
 /* No-op if data/len is empty, absurdly long for a magic constant (32+
-   bytes strongly suggests a mis-grouped run, not a real fixed value), the
-   global cap is already hit, or this exact value is already in the set. */
+   bytes strongly suggests a mis-grouped run, not a real fixed value), or
+   this exact value is already in the set. No count cap -- individual
+   values are cheap (<=32 bytes each) and the whole point is not to lose
+   real data to an arbitrary ceiling. */
 static void dict_add(worker_dict_t *d, const u8 *data, u32 len) {
 
   if (!d || !data || !len || len > WORKER_DICT_MAX_ENTRY_LEN) return;
-  if (d->count >= WORKER_DICT_MAX_ENTRIES) return;
   if (dict_contains(d, data, len)) return;
 
   if (d->count == d->cap) {
@@ -646,7 +646,6 @@ static void dict_add_group(worker_dict_t *d, struct dtaint_tag_seg_wire *segs, u
   }
 
   if (dict_group_exists(d, segs, n_segs, orig_input, orig_input_len)) return;
-  if (d->groups_count + n_segs > WORKER_DICT_MAX_ENTRIES) return;
 
   u32 gid = d->next_group_id++;
 
