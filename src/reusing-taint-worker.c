@@ -683,6 +683,52 @@ static void dict_write_escaped(FILE *f, const u8 *data, u32 len) {
 
 }
 
+/* One output line's worth of segments -- a standalone entry is a
+   1-segment row, a group is an n_segs-segment row. lens[] doubles as
+   both "this row's label pattern" and each segment's actual byte length
+   (they're the same number). datas[] points at existing storage (owned
+   by d->entries/d->groups), never copied. */
+typedef struct {
+
+  u32   n_segs;
+  u32  *lens;
+  u8  **datas;
+
+} dict_row_t;
+
+/* Sort key: fewer segments first, then lexicographically by segment
+   length in order (the first segment's size breaks ties before the
+   second's, and so on) -- i.e. ascending by the label pattern itself. */
+static int cmp_dict_row(const void *a, const void *b) {
+
+  const dict_row_t *ra = a, *rb = b;
+
+  if (ra->n_segs != rb->n_segs) return (ra->n_segs > rb->n_segs) - (ra->n_segs < rb->n_segs);
+
+  for (u32 i = 0; i < ra->n_segs; i++) {
+
+    if (ra->lens[i] != rb->lens[i]) return (ra->lens[i] > rb->lens[i]) - (ra->lens[i] < rb->lens[i]);
+
+  }
+
+  return 0;
+
+}
+
+static u8 dict_row_same_pattern(const dict_row_t *a, const dict_row_t *b) {
+
+  if (a->n_segs != b->n_segs) return 0;
+
+  for (u32 i = 0; i < a->n_segs; i++) {
+
+    if (a->lens[i] != b->lens[i]) return 0;
+
+  }
+
+  return 1;
+
+}
+
 static void dict_write(worker_dict_t *d, const char *path) {
 
   if (!d || (!d->count && !d->groups_count)) return;
@@ -698,38 +744,97 @@ static void dict_write(worker_dict_t *d, const char *path) {
   fprintf(f, "# extracted by reusing-taint-worker -- %u entries, %u grouped segments\n",
           d->count, d->groups_count);
 
-  for (u32 i = 0; i < d->count; i++) {
+  /* Count groups (contiguous group_id runs) first, to size the row array. */
+  u32 n_groups = 0;
 
-    fputc('[', f);
-    fputc('"', f);
-    dict_write_escaped(f, d->entries[i].data, d->entries[i].len);
-    fputs("\"]\n", f);
+  for (u32 i = 0; i < d->groups_count; ) {
+
+    u32 gid = d->groups[i].group_id;
+    while (i < d->groups_count && d->groups[i].group_id == gid) i++;
+    n_groups++;
 
   }
 
-  /* Entries sharing a group_id are always contiguous (see dict_add_group()),
-     so each run renders as one ["...","...",...] line. */
-  u32 gi = 0;
-  while (gi < d->groups_count) {
+  u32         n_rows = d->count + n_groups;
+  dict_row_t *rows = n_rows ? ck_alloc(n_rows * sizeof(dict_row_t)) : NULL;
+  u32         ri = 0;
 
-    u32 gid = d->groups[gi].group_id;
+  for (u32 i = 0; i < d->count; i++) {
+
+    rows[ri].n_segs = 1;
+    rows[ri].lens = ck_alloc(sizeof(u32));
+    rows[ri].lens[0] = d->entries[i].len;
+    rows[ri].datas = ck_alloc(sizeof(u8 *));
+    rows[ri].datas[0] = d->entries[i].data;
+    ri++;
+
+  }
+
+  for (u32 i = 0; i < d->groups_count; ) {
+
+    u32 gid = d->groups[i].group_id;
+    u32 start = i;
+
+    while (i < d->groups_count && d->groups[i].group_id == gid) i++;
+
+    u32 n = i - start;
+    rows[ri].n_segs = n;
+    rows[ri].lens = ck_alloc(n * sizeof(u32));
+    rows[ri].datas = ck_alloc(n * sizeof(u8 *));
+
+    for (u32 s = 0; s < n; s++) {
+
+      rows[ri].lens[s] = d->groups[start + s].len;
+      rows[ri].datas[s] = d->groups[start + s].data;
+
+    }
+
+    ri++;
+
+  }
+
+  if (n_rows) qsort(rows, n_rows, sizeof(dict_row_t), cmp_dict_row);
+
+  for (u32 i = 0; i < n_rows; i++) {
+
+    if (i == 0 || !dict_row_same_pattern(&rows[i - 1], &rows[i])) {
+
+      fprintf(f, "# label pattern: [");
+
+      for (u32 s = 0; s < rows[i].n_segs; s++) {
+
+        if (s) fputc(',', f);
+        fprintf(f, "%u", rows[i].lens[s]);
+
+      }
+
+      fputs("]\n", f);
+
+    }
+
     fputc('[', f);
 
-    u8 first = 1;
-    while (gi < d->groups_count && d->groups[gi].group_id == gid) {
+    for (u32 s = 0; s < rows[i].n_segs; s++) {
 
-      if (!first) fputc(',', f);
-      first = 0;
+      if (s) fputc(',', f);
       fputc('"', f);
-      dict_write_escaped(f, d->groups[gi].data, d->groups[gi].len);
+      dict_write_escaped(f, rows[i].datas[s], rows[i].lens[s]);
       fputc('"', f);
-      gi++;
 
     }
 
     fputs("]\n", f);
 
   }
+
+  for (u32 i = 0; i < n_rows; i++) {
+
+    ck_free(rows[i].lens);
+    ck_free(rows[i].datas);
+
+  }
+
+  if (rows) ck_free(rows);
 
   fclose(f);
 
