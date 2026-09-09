@@ -274,7 +274,8 @@ static void usage(u8 *argv0, int more_help) {
       "  -i dir        - input directory with test cases (or '-' to resume, "
       "also see \n"
       "                  AFL_AUTORESUME)\n"
-      "  -o dir        - output directory for fuzzer findings\n\n"
+      "  -o dir        - output directory for fuzzer findings\n"
+      "  -r dir        - reserved, not yet used\n\n"
 
       "Execution control settings:\n"
       "  -P strategy   - set fix mutation strategy: explore (focus on new "
@@ -815,7 +816,7 @@ void afl_parse_commandline(afl_state_t *afl, int argc, char **argv) {
   // still available: HjJkqrv
   while ((opt = getopt(
               argc, argv,
-              "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:K:l:L::m:M:nNo:Op:P:Qs:S:t:T:"
+              "+a:Ab:B:c:CdDe:E:f:F:g:G:hi:I:K:l:L::m:M:nNo:Op:P:Qr:s:S:t:T:"
               "uUV:w:WXx:YzZ")) > 0) {
 
     switch (opt) {
@@ -1047,6 +1048,12 @@ void afl_parse_commandline(afl_state_t *afl, int argc, char **argv) {
 
         if (afl->out_dir) { FATAL("Multiple -o options not supported"); }
         afl->out_dir = optarg;
+        break;
+
+      case 'r':                                    /* reusing dir, TBD */
+
+        if (afl->reusing_dir) { FATAL("Multiple -r options not supported"); }
+        afl->reusing_dir = optarg;
         break;
 
       case 'M': {                                           /* main sync ID */

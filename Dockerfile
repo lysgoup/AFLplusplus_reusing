@@ -96,7 +96,15 @@ ARG TEST_BUILD
 RUN python3 -m venv .venv
 ENV PATH="/AFLplusplus/.venv/bin:$PATH"
 
-RUN sed -i.bak 's/^	-/	/g' GNUmakefile && \
+# The CFLAGS_FLTO neutering (2nd -e) works around a GCC 11 LTO
+# internal-compiler-error (ICE) in XXH3_hashLong_64b_default's SSE2
+# intrinsics during whole-program codegen. Confirmed by testing: passing
+# CFLAGS_FLTO= to a link that reuses ALREADY-LTO-compiled .o's still fails
+# (they contain GIMPLE-bytecode-only objects, so the linker still invokes
+# lto-wrapper) -- only actually fixes it once EVERYTHING involved, .o's
+# included, is (re)compiled without LTO from a clean state, which `make
+# clean` right after this sed already guarantees here.
+RUN sed -i.bak -e 's/^	-/	/g' -e 's/CFLAGS_FLTO ?= -flto.*/CFLAGS_FLTO ?=/' GNUmakefile && \
     make clean && make distrib && \
     ([ "${TEST_BUILD}" ] || (make install)) && \
     mv GNUmakefile.bak GNUmakefile

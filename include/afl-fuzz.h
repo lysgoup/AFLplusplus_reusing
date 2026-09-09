@@ -638,6 +638,7 @@ typedef struct afl_state {
 
   u8 *in_dir,                           /* Input directory with test cases  */
       *out_dir,                         /* Working & output directory       */
+      *reusing_dir,                     /* -r: absolute path, TBD           */
       *tmp_dir,                         /* Temporary directory for input    */
       *sync_dir,                        /* Synchronization directory        */
       *sync_id,                         /* Fuzzer ID                        */
