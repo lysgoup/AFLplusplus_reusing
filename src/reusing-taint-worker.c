@@ -1232,6 +1232,62 @@ static worker_tag_lookup_t *pick_primary_side(worker_tag_lookup_t *tags, u32 n_t
 
 }
 
+/* The other half of get_offsets_and_variables(): whichever side
+   pick_primary_side() did *not* return, i.e. Angora's `cond.offsets_opt`.
+   Only meaningful when both operands are tainted under two *distinct*
+   labels -- that same function guards its own offsets_opt assignment with
+   `lb2 > 0 && lb1 != lb2` (one label sitting on both sides of a comparison
+   describes one span, not two, so there is no second operand to attack).
+   Returns NULL when there is no such side, so callers can just skip it.
+
+   Angora feeds this side through create_record_for_offsets() exactly like
+   the primary one (label_pattern_tracker.rs's add_dual_label_records ->
+   two create_record_for_offsets calls, operand_num 1 and 2), and drives
+   mutation from it as a distinct search stage (cond_state.rs's
+   to_offsets_opt swaps offsets/offsets_opt, then to_offsets_all merges
+   them) -- both spans are genuinely reusable, not one canonical span plus
+   a redundant copy. */
+static worker_tag_lookup_t *pick_secondary_side(worker_tag_lookup_t *tags, u32 n_tags,
+                                                u32 lb1, u32 lb2,
+                                                worker_tag_lookup_t *primary) {
+
+  if (!lb1 || !lb2 || lb1 == lb2) return NULL;
+
+  worker_tag_lookup_t *t1 = find_tag(tags, n_tags, lb1);
+  worker_tag_lookup_t *t2 = find_tag(tags, n_tags, lb2);
+  worker_tag_lookup_t *other = primary == t1 ? t2 : t1;
+
+  return other && other->n_segs ? other : NULL;
+
+}
+
+/* One tainted operand's worth of dict entries: a single-segment tag stores
+   that one span (dropped if it's only 1 byte -- rarely meaningful alone); a
+   multi-segment tag stores each segment on its own (same 1-byte drop,
+   applied per segment) *and*, separately, every segment of that same label
+   under one shared group_id (dict_add_group()) so which segments co-occurred
+   in the same label stays recoverable even though they're never
+   concatenated into a single blob. Shared by the primary and the
+   offsets_opt side so both get identical treatment. */
+static void dict_add_side(worker_dict_t *d, worker_tag_lookup_t *side,
+                          const u8 *orig_input, u32 orig_input_len) {
+
+  if (side->n_segs > 1) {
+
+    dict_add_group(d, side->segs, side->n_segs, orig_input, orig_input_len);
+
+  }
+
+  for (u32 s = 0; s < side->n_segs; s++) {
+
+    u32 b = side->segs[s].begin, e = side->segs[s].end;
+    if (e - b <= 1 || e > orig_input_len) continue;
+    dict_add(d, orig_input + b, e - b);
+
+  }
+
+}
+
 typedef struct {
 
   u32 idx;      /* index into the file's cond_list */
@@ -1411,14 +1467,12 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
 
      For the dict: a grouped byte-chain (see above) becomes one combined
      value, since it's already established as one genuinely contiguous
-     span. Otherwise this uses whichever of lb1/lb2 is the "primary" side
-     (see pick_primary_side()): a single-segment tag stores that one span
-     (dropped if it's only 1 byte -- rarely meaningful alone); a multi-
-     segment tag stores each segment on its own (same 1-byte drop, applied
-     per segment) *and*, separately, every segment of that same label
-     under one shared group_id (see dict_add_group()) so which segments
-     co-occurred in the same label stays recoverable even though they're
-     never concatenated into a single blob. */
+     span. Otherwise this emits both tainted operands, mirroring the two
+     halves get_offsets_and_variables() fills in -- the "primary" side
+     (pick_primary_side(), Angora's cond.offsets) always, plus the
+     offsets_opt side (pick_secondary_side()) when the comparison has two
+     distinct tainted operands. dict_add_side() documents what one side
+     turns into. */
 
   for (u32 i = 0; orig_input && i < hdr.n_conds; i++) {
 
@@ -1450,17 +1504,19 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
     cond_status_update(cond_status, conds[i].cmpid, conds[i].context, conds[i].op,
                        conds[i].condition);
 
-    if (primary->n_segs > 1) {
+    dict_add_side(dict, primary, orig_input, orig_input_len);
 
-      dict_add_group(dict, primary->segs, primary->n_segs, orig_input, orig_input_len);
+    /* An input-vs-input comparison (`hdr->width == hdr->height`) is
+       satisfiable from either operand's bytes, so the side pick_primary_side()
+       passed over is a second, independent set of values -- emit it too
+       rather than letting it fall on the floor. NULL for the overwhelmingly
+       common single-tainted-operand case, so this costs nothing there. */
+    worker_tag_lookup_t *secondary = pick_secondary_side(
+        tags, hdr.n_tags, conds[i].lb1, conds[i].lb2, primary);
 
-    }
+    if (secondary) {
 
-    for (u32 s = 0; s < primary->n_segs; s++) {
-
-      u32 b = primary->segs[s].begin, e = primary->segs[s].end;
-      if (e - b <= 1 || e > orig_input_len) continue;
-      dict_add(dict, orig_input + b, e - b);
+      dict_add_side(dict, secondary, orig_input, orig_input_len);
 
     }
 
@@ -1700,38 +1756,86 @@ static void process_queue_entry(afl_forkserver_t *fsrv, const char *src_dir,
 
 }
 
+/* scandir() comparator: plain byte order, deliberately NOT alphasort() --
+   that one runs strcoll(), which would put the scan order (and with it both
+   accumulated outputs, see run_seed_scan's comment) at the mercy of
+   whatever LC_COLLATE the caller happens to have set. */
+static int cmp_seed_dirent(const struct dirent **a, const struct dirent **b) {
+
+  return strcmp((*a)->d_name, (*b)->d_name);
+
+}
+
+/* scandir() filter: same skips the readdir() loop this replaced did. The
+   leading-dot test covers "." and ".." along with every other dotfile. */
+static int keep_seed_dirent(const struct dirent *de) {
+
+  if (de->d_name[0] == '.') return 0;
+#ifdef DT_DIR
+  if (de->d_type == DT_DIR) return 0;
+#endif
+  return 1;
+
+}
+
 /* -S seed_dir mode's whole job: run dtaint once over every plain file in
    seed_dir and drop "<filename>.dtaint" into out_dir (the flat cache dir a
    later -c out_dir on a live-mode run will point back at). No queue/, no
    poll loop, no "orig:" involved (a raw seed filename never contains it) --
    process_queue_entry()'s cache-hit check is simply a no-op here, it just
-   runs the forkserver on every file and files away whatever comes out. */
+   runs the forkserver on every file and files away whatever comes out.
+
+   Files are visited in name order, via scandir(), not in raw readdir()
+   order. The per-input .dtaint outputs don't care -- each is a pure
+   function of its own input -- but value_pool.dict and unsolved_condition
+   are accumulated across the whole scan behind a first-observation-wins
+   novelty gate (novelty_check_and_mark(), see the extraction pass), so
+   whichever input reaches a given (cmpid, context, condition) first is the
+   one whose bytes land in the dict. Under readdir() order that made both
+   outputs a property of the filesystem's directory layout rather than of
+   the seed set: measured on 400 exiv2 seeds, re-scanning the same contents
+   from a directory whose entries enumerated in a different order kept only
+   61 of 119 value_pool.dict rows (unsolved_condition held up much better,
+   323 of 325, since it accumulates sites and outcome directions rather
+   than values). Sorting makes a given seed set produce one answer no
+   matter which directory, filesystem, or machine it is scanned from --
+   which is what makes two runs' pools comparable at all. Live mode already
+   had this property for free: scan_new_queue_entries() qsort()s by queue
+   id. */
 static void run_seed_scan(afl_forkserver_t *fsrv, const char *seed_dir,
                           const char *out_dir, worker_dict_t *dict,
                           novelty_set_t *novelty, cond_status_set_t *cond_status) {
 
-  DIR *d = opendir(seed_dir);
-  if (!d) { PFATAL("Unable to open seed dir '%s'", seed_dir); }
+  struct dirent **list = NULL;
+  int             n_ents = scandir(seed_dir, &list, keep_seed_dirent, cmp_seed_dirent);
 
-  if (!quiet_mode) { ACTF("Seed scan: scanning '%s'...", seed_dir); }
+  if (n_ents < 0) { PFATAL("Unable to open seed dir '%s'", seed_dir); }
 
-  u32            n = 0;
-  struct dirent *de;
+  if (!quiet_mode) {
 
-  while (!stop_soon && (de = readdir(d))) {
-
-    if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-#ifdef DT_DIR
-    if (de->d_type == DT_DIR) continue;
-#endif
-    if (de->d_name[0] == '.') continue;
-
-    process_queue_entry(fsrv, seed_dir, out_dir, NULL, NULL, dict, novelty, cond_status, de->d_name);
-    ++n;
+    ACTF("Seed scan: scanning '%s' (%d file(s), name order)...", seed_dir, n_ents);
 
   }
 
-  closedir(d);
+  u32 n = 0;
+
+  for (int i = 0; i < n_ents; i++) {
+
+    /* Keep draining the list even after a Ctrl-C so scandir()'s own
+       allocations all get released -- just stop running the target. */
+    if (!stop_soon) {
+
+      process_queue_entry(fsrv, seed_dir, out_dir, NULL, NULL, dict, novelty,
+                          cond_status, list[i]->d_name);
+      ++n;
+
+    }
+
+    free(list[i]);
+
+  }
+
+  free(list);
 
   if (!quiet_mode) {
 
