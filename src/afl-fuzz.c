@@ -275,7 +275,10 @@ static void usage(u8 *argv0, int more_help) {
       "also see \n"
       "                  AFL_AUTORESUME)\n"
       "  -o dir        - output directory for fuzzer findings\n"
-      "  -r dir        - reserved, not yet used\n\n"
+      "  -r dir        - directory of taint-analysis output for this target\n"
+      "                  (afl-taint-scan's value_pool.dict / "
+      "unsolved_condition);\n"
+      "                  '-r -' turns it back off\n\n"
 
       "Execution control settings:\n"
       "  -P strategy   - set fix mutation strategy: explore (focus on new "
@@ -1050,10 +1053,25 @@ void afl_parse_commandline(afl_state_t *afl, int argc, char **argv) {
         afl->out_dir = optarg;
         break;
 
-      case 'r':                                    /* reusing dir, TBD */
+      case 'r':                                             /* reusing dir */
 
         if (afl->reusing_dir) { FATAL("Multiple -r options not supported"); }
-        afl->reusing_dir = optarg;
+
+        /* '-r -' turns reusing back off, mirroring '-c -' for cmplog, so a
+           wrapper script can pass -r unconditionally and still express
+           "no reuse". */
+        if (!strcmp(optarg, "-")) {
+
+          ACTF("Disabling reusing again because of '-r -'.");
+          afl->reusing_mode = 0;
+
+        } else {
+
+          afl->reusing_mode = 1;
+          afl->reusing_dir = optarg;
+
+        }
+
         break;
 
       case 'M': {                                           /* main sync ID */
@@ -2970,6 +2988,8 @@ void afl_alloc_shared_memory(afl_state_t *afl) {
 
   }
 
+  load_reusing_data(afl);
+
   if (afl->fsrv.out_file && afl->fsrv.use_shmem_fuzz) {
 
     unlink(afl->fsrv.out_file);
@@ -3675,6 +3695,7 @@ void stop_fuzzing(afl_state_t *afl) {
 
   destroy_queue(afl);
   destroy_extras(afl);
+  destroy_reusing_data(afl);
   destroy_custom_mutators(afl);
   afl_shm_deinit(&afl->shm);
 

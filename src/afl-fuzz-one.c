@@ -632,6 +632,19 @@ u8 fuzz_one(afl_state_t *afl) {
 
   }
 
+  /* Reusing: apply afl-taint-scan's precomputed value pool at this
+     input's own taint offsets. Sits right after cmplog for the same reason
+     cmplog sits here -- both drive mutation from comparison information
+     gathered outside the fuzzer -- and deliberately ahead of the
+     deterministic skip logic below, which would otherwise jump straight to
+     custom_mutator_stage and skip this entirely for most entries. */
+
+  if (unlikely(afl->reusing_mode)) {
+
+    if (reusing_stage(afl, in_buf, out_buf, len)) { goto abandon_entry; }
+
+  }
+
   u64 before_det_time = get_cur_time();
 #ifdef INTROSPECTION
 

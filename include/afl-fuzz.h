@@ -346,6 +346,35 @@ struct auto_extra_data {
 
 };
 
+/* One segment of a value pool entry -- same shape as struct extra_data
+   above, but a piece of one value candidate rather than a whole dictionary
+   token. */
+
+struct value_pool_seg {
+
+  u8 *data;                             /* Segment bytes                    */
+  u32 len;                              /* Segment length                   */
+
+};
+
+/* One entry of the value pool: a single line of afl-taint-scan's
+   value_pool.dict (-r), i.e. one value candidate. n_segs == 1 is a plain
+   magic-byte value; more than that is a run of segments that came out of
+   the same taint label, so they all have to be in place at once for the
+   branch behind them to flip -- which is why the segments stay grouped
+   here instead of being flattened into independent tokens.
+
+   Note the file's own header line counts only the 1-segment rows as
+   "entries" (the rest as "grouped segments"); here every line is an
+   entry. */
+
+struct value_pool_entry {
+
+  struct value_pool_seg *segs;          /* Segments, in file order          */
+  u32                    n_segs;        /* How many                         */
+
+};
+
 /* Fuzzing stages */
 enum {
 
@@ -388,6 +417,9 @@ enum {
   /* 36 */ STAGE_SPLICE_INSERT,
   // max havoc mutation types
   STAGE_HAVOC_MAX,
+  /* Must stay past STAGE_HAVOC_MAX -- it is a stage of its own (see
+     reusing_stage()), not a havoc mutation the havoc loop can pick. */
+  STAGE_REUSING,
   // other stages
   STAGE_FLIP1,
   STAGE_FLIP2,
@@ -841,6 +873,19 @@ typedef struct afl_state {
 
   char            *cmplog_binary;
   afl_forkserver_t cmplog_fsrv;     /* cmplog has its own little forkserver */
+
+  /* Reusing (-r): afl-taint-scan's output, loaded once at startup.
+     Unlike cmplog there is no second forkserver and no shared map -- the
+     analysis already ran. unsolved_cmpids keeps only the cmpid, not the
+     (cmpid, context) pair the file is keyed on: the distinct cmpid count
+     stays tiny (700-1300) where the pair count does not (1.2M for mujs). */
+
+  u8                       reusing_mode;    /* -r given (and not '-r -')    */
+  struct value_pool_entry *value_pool;      /* value_pool.dict, one per line*/
+  u32                      value_pool_cnt;  /* Entries loaded               */
+  u32                      value_pool_segs; /* Segments across all entries  */
+  u32                     *unsolved_cmpids; /* sorted, for bsearch()        */
+  u32                      unsolved_cmpids_cnt;
 
   /* ASAN Fuzing */
   char            *san_binary[MAX_EXTRA_SAN_BINARY];
@@ -1392,6 +1437,12 @@ void maybe_add_auto(afl_state_t *, u8 *, u32);
 void save_auto(afl_state_t *);
 void load_auto(afl_state_t *);
 void destroy_extras(afl_state_t *);
+
+/* Reusing (-r) */
+
+void load_reusing_data(afl_state_t *);
+void destroy_reusing_data(afl_state_t *);
+u8   reusing_stage(afl_state_t *, u8 *, u8 *, u32);
 
 /* Stats */
 
