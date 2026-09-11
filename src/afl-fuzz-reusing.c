@@ -7,8 +7,8 @@
 
      value_pool.dict     - value candidates, one entry per line, each entry
                            one or more segments (see struct value_pool_entry)
-     unsolved_condition  - comparison sites never seen going more than one
-                           way; only the cmpid is kept here
+     unsolved_condition  - (cmpid, context) sites never seen going more than
+                           one way
 
    Both are currently mandatory once -r is given: a missing or unreadable
    file is FATAL. That is deliberately strict for now -- while the reuse
@@ -309,17 +309,20 @@ static void load_value_pool(afl_state_t *afl) {
 
 }
 
-static int cmp_u32(const void *a, const void *b) {
+static int cmp_unsolved_site(const void *a, const void *b) {
 
-  u32 x = *(const u32 *)a, y = *(const u32 *)b;
-  return (x > y) - (x < y);
+  const struct unsolved_site *x = a, *y = b;
+
+  if (x->cmpid != y->cmpid) { return x->cmpid < y->cmpid ? -1 : 1; }
+  if (x->context != y->context) { return x->context < y->context ? -1 : 1; }
+  return 0;
 
 }
 
-/* unsolved_condition -> afl->unsolved_cmpids, deduped and sorted. Lines look
-   like "cmpid=<n> context=<n>"; only the cmpid is kept. */
+/* unsolved_condition -> afl->unsolved, deduped and sorted. Lines look like
+   "cmpid=<n> context=<n>". */
 
-static void load_unsolved_cmpids(afl_state_t *afl) {
+static void load_unsolved_sites(afl_state_t *afl) {
 
   u8   *fname = alloc_printf("%s/unsolved_condition", afl->reusing_dir);
   FILE *f = fopen((char *)fname, "r");
@@ -330,13 +333,13 @@ static void load_unsolved_cmpids(afl_state_t *afl) {
 
   }
 
-  u8  *line = ck_alloc(REUSING_MAX_UNSOLVED_LINE);
-  u32  cap = 0, n = 0, lines = 0, overlong = 0;
-  u32 *ids = NULL;
+  u8                   *line = ck_alloc(REUSING_MAX_UNSOLVED_LINE);
+  u32                   cap = 0, n = 0, lines = 0, overlong = 0;
+  struct unsolved_site *sites = NULL;
 
   while (fgets((char *)line, REUSING_MAX_UNSOLVED_LINE, f)) {
 
-    u32 cmpid;
+    u32 cmpid, context;
 
     /* Same fgets() split as above. Harmless here -- a tail fragment simply
        fails the sscanf() below -- but count it so a silently ignored file
@@ -355,18 +358,24 @@ static void load_unsolved_cmpids(afl_state_t *afl) {
 
     if (line[0] == '#') { continue; }
 
-    if (sscanf((char *)line, "cmpid=%u", &cmpid) != 1) { continue; }
+    if (sscanf((char *)line, "cmpid=%u context=%u", &cmpid, &context) != 2) {
+
+      continue;
+
+    }
 
     ++lines;
 
     if (n == cap) {
 
       cap = cap ? cap * 2 : 1024;
-      ids = ck_realloc(ids, cap * sizeof(u32));
+      sites = ck_realloc(sites, cap * sizeof(struct unsolved_site));
 
     }
 
-    ids[n++] = cmpid;
+    sites[n].cmpid = cmpid;
+    sites[n].context = context;
+    ++n;
 
   }
 
@@ -380,33 +389,35 @@ static void load_unsolved_cmpids(afl_state_t *afl) {
 
   }
 
-  /* Sort, then squeeze duplicates out in place: the file is keyed on
-     (cmpid, context), so one site shows up once per context it was reached
-     from -- 1.2M lines collapse to ~1100 sites for mujs. */
+  /* Sorted so lookups can bsearch(); deduped in case the file ever repeats a
+     pair. */
 
   if (n) {
 
-    qsort(ids, n, sizeof(u32), cmp_u32);
+    qsort(sites, n, sizeof(struct unsolved_site), cmp_unsolved_site);
 
     u32 uniq = 1;
 
     for (u32 i = 1; i < n; i++) {
 
-      if (ids[i] != ids[uniq - 1]) { ids[uniq++] = ids[i]; }
+      if (cmp_unsolved_site(&sites[i], &sites[uniq - 1])) {
+
+        sites[uniq++] = sites[i];
+
+      }
 
     }
 
     n = uniq;
-    ids = ck_realloc(ids, n * sizeof(u32));
+    sites = ck_realloc(sites, n * sizeof(struct unsolved_site));
 
   }
 
-  afl->unsolved_cmpids = ids;
-  afl->unsolved_cmpids_cnt = n;
+  afl->unsolved = sites;
+  afl->unsolved_cnt = n;
 
-  OKF("Loaded %u unsolved comparison site%s (from %u (cmpid, context) "
-      "line%s) from '%s'.",
-      n, n == 1 ? "" : "s", lines, lines == 1 ? "" : "s", fname);
+  OKF("Loaded %u unsolved comparison site%s (from %u line%s) from '%s'.", n,
+      n == 1 ? "" : "s", lines, lines == 1 ? "" : "s", fname);
 
   ck_free(fname);
 
@@ -419,7 +430,7 @@ void load_reusing_data(afl_state_t *afl) {
   ACTF("Loading reusing taint data from '%s'...", afl->reusing_dir);
 
   load_value_pool(afl);
-  load_unsolved_cmpids(afl);
+  load_unsolved_sites(afl);
 
 }
 
@@ -443,10 +454,10 @@ void destroy_reusing_data(afl_state_t *afl) {
   afl->value_pool_cnt = 0;
   afl->value_pool_segs = 0;
 
-  if (afl->unsolved_cmpids) { ck_free(afl->unsolved_cmpids); }
+  if (afl->unsolved) { ck_free(afl->unsolved); }
 
-  afl->unsolved_cmpids = NULL;
-  afl->unsolved_cmpids_cnt = 0;
+  afl->unsolved = NULL;
+  afl->unsolved_cnt = 0;
 
 }
 

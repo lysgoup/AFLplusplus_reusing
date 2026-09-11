@@ -375,6 +375,17 @@ struct value_pool_entry {
 
 };
 
+/* One line of unsolved_condition (-r): a comparison site that has only ever
+   gone one way. Keyed on the pair, since a site can be solved under one call
+   context and still open under another. */
+
+struct unsolved_site {
+
+  u32 cmpid;
+  u32 context;
+
+};
+
 /* Fuzzing stages */
 enum {
 
@@ -874,18 +885,14 @@ typedef struct afl_state {
   char            *cmplog_binary;
   afl_forkserver_t cmplog_fsrv;     /* cmplog has its own little forkserver */
 
-  /* Reusing (-r): afl-taint-scan's output, loaded once at startup.
-     Unlike cmplog there is no second forkserver and no shared map -- the
-     analysis already ran. unsolved_cmpids keeps only the cmpid, not the
-     (cmpid, context) pair the file is keyed on: the distinct cmpid count
-     stays tiny (700-1300) where the pair count does not (1.2M for mujs). */
+  /* Reusing (-r): afl-taint-scan's output, loaded once at startup. */
 
   u8                       reusing_mode;    /* -r given (and not '-r -')    */
   struct value_pool_entry *value_pool;      /* value_pool.dict, one per line*/
   u32                      value_pool_cnt;  /* Entries loaded               */
   u32                      value_pool_segs; /* Segments across all entries  */
-  u32                     *unsolved_cmpids; /* sorted, for bsearch()        */
-  u32                      unsolved_cmpids_cnt;
+  struct unsolved_site    *unsolved;        /* sorted, for bsearch()        */
+  u32                      unsolved_cnt;
   u32                      taint_success;   /* seeds with a pool .dtaint    */
   u32                      taint_missing;   /* seeds without one            */
 
