@@ -199,12 +199,12 @@ struct dtaint_file_header {
 #define DTAINT_FILE_VERSION 2U
 
 /* ---------------------------------------------------------------------- */
-/* reusing-taint-worker's own output format (src/reusing-taint-worker.c). */
+/* afl-taint-scan's own output format (src/afl-taint-scan.c).             */
 /*                                                                          */
 /* dfsan_legacy's runtime (dtaint_runtime/dtaint_logger.c) only ever      */
 /* writes DTAINT_FILE_VERSION==2, plain dtaint_cond_record entries -- that */
 /* format is unchanged above and is what a dtaint-instrumented target      */
-/* produces raw, on every run. reusing-taint-worker.c is the sole reader   */
+/* produces raw, on every run. afl-taint-scan.c is the sole reader        */
 /* of that raw scratch file: after each run it transcodes it into this     */
 /* version-3 format before persisting/caching, gluing runs of adjacent     */
 /* single-byte magic-byte comparisons (see is_magic_byte_cmp() below)      */

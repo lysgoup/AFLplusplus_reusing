@@ -78,14 +78,14 @@ RUN git clone --depth=1 https://github.com/AFLplusplus/cov-analysis && \
     (cd cov-analysis && make install) && rm -rf cov-analysis
 
 WORKDIR /AFLplusplus
-# src/reusing-taint-worker.c is excluded here and copied in separately,
+# src/afl-taint-scan.c is excluded here and copied in separately,
 # right before the step that actually builds it (after the expensive
 # make distrib/install above) -- same reasoning as dfsan_legacy's own
 # split further down: this file is the one still actively iterating,
 # and it doesn't participate in make distrib/install at all (a fully
 # standalone new binary, see GNUmakefile's own target), so there's no
 # reason a one-line change to it should invalidate that ~10 minute step.
-COPY --exclude=src/reusing-taint-worker.c . .
+COPY --exclude=src/afl-taint-scan.c . .
 
 ARG CC=gcc-$GCC_VERSION
 ARG CXX=g++-$GCC_VERSION
@@ -109,13 +109,13 @@ RUN sed -i.bak -e 's/^	-/	/g' -e 's/CFLAGS_FLTO ?= -flto.*/CFLAGS_FLTO ?=/' GNUm
     ([ "${TEST_BUILD}" ] || (make install)) && \
     mv GNUmakefile.bak GNUmakefile
 
-# reusing-taint-worker: standalone, links only against the generic
+# afl-taint-scan: standalone, links only against the generic
 # forkserver .o's (see GNUmakefile's own target comment) -- built and
 # installed here so it ships in the same base image as afl-fuzz. Copied in
 # separately (excluded from the main COPY . . above) so iterating on it
 # doesn't invalidate the make distrib/install layer above.
-COPY src/reusing-taint-worker.c src/reusing-taint-worker.c
-RUN make reusing-taint-worker && install -m 755 reusing-taint-worker /usr/local/bin/
+COPY src/afl-taint-scan.c src/afl-taint-scan.c
+RUN make afl-taint-scan && install -m 755 afl-taint-scan /usr/local/bin/
 
 # --- Real DFSan (Angora-parity) dynamic taint tracking ---------------------
 # See dfsan_legacy/README.md for the full rationale and verification notes:
