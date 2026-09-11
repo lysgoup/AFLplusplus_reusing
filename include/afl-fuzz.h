@@ -328,6 +328,11 @@ struct queue_entry {
      flag instead of letting the favoured set grow monotonically. */
   u32 tightness_novel_cycle;            /* cycle when tightness_novel set   */
 
+  u32 *reusing_cur;                     /* Next pool entry to try, one per
+                                           offsets of this input's taint
+                                           map (-r)                         */
+  u32  reusing_cnt;                     /* How many offsets it covers       */
+
 };
 
 struct extra_data {
@@ -442,6 +447,9 @@ struct offsets {
   u32                n_offsets;
   struct taint_site *sites;
   u32                n_sites;
+  u32                idx;               /* position before filtering, which
+                                           is what queue_entry.reusing_cur
+                                           is indexed by                    */
 
 };
 

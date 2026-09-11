@@ -1083,6 +1083,7 @@ struct taint_map *taint_map_load(afl_state_t *afl, u8 *queue_name) {
 
     while (j < n_cand && !cmp_offset_key(first, &cand[idx[j]])) { ++j; }
 
+    dst->idx = m->n_offsets - 1;
     dst->n_offsets = first->n_offsets;
     dst->offsets = ck_alloc(dst->n_offsets * sizeof(struct offset));
     memcpy(dst->offsets, coff + first->offset_idx,
@@ -1179,63 +1180,175 @@ void taint_map_free(struct taint_map *m) {
 
 }
 
-/* Reusing stage: apply pool entries at this input's taint sites by taint
-   pattern. Returns 1 to abandon the entry. Mutation not implemented yet. */
+/* The bucket holding values shaped like this offsets' ranges, or NULL if
+   there is nothing to try here. Wider than a pool entry can be means there
+   is nothing to find, since afl-taint-scan caps a value at that many
+   segments too; a range past the end of the input means the .dtaint no
+   longer describes it, so leave those bytes alone. */
+
+static struct value_bucket *reusing_bucket(afl_state_t *afl, struct offsets *g,
+                                           u32 len) {
+
+  u32 lens[REUSING_MAX_SEGS_PER_ENTRY];
+
+  if (g->n_offsets > REUSING_MAX_SEGS_PER_ENTRY) { return NULL; }
+
+  for (u32 i = 0; i < g->n_offsets; i++) {
+
+    if (g->offsets[i].end > len) { return NULL; }
+    lens[i] = g->offsets[i].end - g->offsets[i].begin;
+
+  }
+
+  return value_pool_find(afl, lens, g->n_offsets);
+
+}
+
+/* Rewrites `buf` at one offsets' ranges with a pool entry's segments. */
+
+static void reusing_apply(u8 *buf, struct offsets *g,
+                          struct value_pool_entry *e) {
+
+  for (u32 i = 0; i < g->n_offsets; i++) {
+
+    memcpy(buf + g->offsets[i].begin, e->segs[i].data, e->segs[i].len);
+
+  }
+
+}
+
+/* Puts back what reusing_apply() overwrote. */
+
+static void reusing_restore(u8 *buf, u8 *orig_buf, struct offsets *g) {
+
+  for (u32 i = 0; i < g->n_offsets; i++) {
+
+    memcpy(buf + g->offsets[i].begin, orig_buf + g->offsets[i].begin,
+           g->offsets[i].end - g->offsets[i].begin);
+
+  }
+
+}
+
+/* Reusing stage: for each of this input's offsets, overwrite its ranges with
+   every value pool entry of the same taint pattern and run the target. Stops
+   after REUSING_MAX_EXEC executions; queue_cur->reusing_cur remembers how far
+   each offsets got, so the next visit picks up at the first value it has not
+   tried -- including any appended to the pool since. Returns 1 if the caller
+   should give up on this queue entry, 0 otherwise. */
 
 u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
-  (void)orig_buf;
-  (void)buf;
+  u8               *qn = strrchr((char *)afl->queue_cur->fname, '/');
+  struct taint_map *m = taint_map_load(afl, qn ? qn + 1 : afl->queue_cur->fname);
 
-  if (afl->debug) {
+  if (!m) {
 
-    u8               *qn = strrchr((char *)afl->queue_cur->fname, '/');
-    struct taint_map *m = taint_map_load(afl, qn ? qn + 1 : afl->queue_cur->fname);
-
-    if (m) {
-
-      taint_map_filter_unsolved(afl, m);
-
-      u32 pats = m->n_offsets ? 1 : 0, ranges = 0, sites = 0;
-
-      for (u32 i = 0; i < m->n_offsets; i++) {
-
-        struct offsets *b = &m->offsets[i];
-
-        ranges += b->n_offsets;
-        sites += b->n_sites;
-
-        if (!i) { continue; }
-
-        struct offsets *a = &m->offsets[i - 1];
-        u8              same = a->n_offsets == b->n_offsets;
-
-        for (u32 k = 0; same && k < a->n_offsets; k++) {
-
-          same = (a->offsets[k].end - a->offsets[k].begin) ==
-                 (b->offsets[k].end - b->offsets[k].begin);
-
-        }
-
-        if (!same) { ++pats; }
-
-      }
-
-      fprintf(stderr,
-              "[D] reusing_stage: '%s' len=%u offsets=%u ranges=%u sites=%u "
-              "patterns=%u\n",
-              afl->queue_cur->fname, len, m->n_offsets, ranges, sites, pats);
-      taint_map_free(m);
-
-    } else {
+    if (afl->debug) {
 
       fprintf(stderr, "[D] reusing_stage: '%s' len=%u (no taint file)\n",
               afl->queue_cur->fname, len);
 
     }
 
+    return 0;
+
   }
 
-  return 0;
+  /* Cursors are indexed by the unfiltered position, which the .dtaint file
+     fixes for good; filtering only decides what to skip. */
+
+  u32 n_all = m->n_offsets;
+
+  taint_map_filter_unsolved(afl, m);
+
+  if (afl->queue_cur->reusing_cnt < n_all) {
+
+    afl->queue_cur->reusing_cur =
+        ck_realloc(afl->queue_cur->reusing_cur, n_all * sizeof(u32));
+    memset(afl->queue_cur->reusing_cur + afl->queue_cur->reusing_cnt, 0,
+           (n_all - afl->queue_cur->reusing_cnt) * sizeof(u32));
+    afl->queue_cur->reusing_cnt = n_all;
+
+  }
+
+  u32 *cur = afl->queue_cur->reusing_cur;
+
+  /* What is left to try, so the UI has a total to count against. */
+
+  afl->stage_max = 0;
+
+  for (u32 i = 0; i < m->n_offsets; i++) {
+
+    struct offsets      *g = &m->offsets[i];
+    struct value_bucket *b = reusing_bucket(afl, g, len);
+
+    if (b && cur[g->idx] < b->n_entries) {
+
+      afl->stage_max += b->n_entries - cur[g->idx];
+
+    }
+
+  }
+
+  if (afl->stage_max > REUSING_MAX_EXEC) { afl->stage_max = REUSING_MAX_EXEC; }
+
+  if (afl->debug) {
+
+    fprintf(stderr, "[D] reusing_stage: '%s' len=%u offsets=%u execs=%u\n",
+            afl->queue_cur->fname, len, m->n_offsets, afl->stage_max);
+
+  }
+
+  if (!afl->stage_max) {
+
+    taint_map_free(m);
+    return 0;
+
+  }
+
+  afl->stage_name = "reusing";
+  afl->stage_short = "reuse";
+  afl->stage_cur = 0;
+
+  u64 orig_hit_cnt = afl->queued_items + afl->saved_crashes;
+  u8  ret = 0;
+
+  for (u32 i = 0; i < m->n_offsets && afl->stage_cur < afl->stage_max; i++) {
+
+    struct offsets      *g = &m->offsets[i];
+    struct value_bucket *b = reusing_bucket(afl, g, len);
+
+    if (!b) { continue; }
+
+    while (cur[g->idx] < b->n_entries && afl->stage_cur < afl->stage_max) {
+
+      reusing_apply(buf, g, &b->entries[cur[g->idx]++]);
+
+      if (common_fuzz_stuff(afl, buf, len)) {
+
+        reusing_restore(buf, orig_buf, g);
+        ret = 1;
+        goto done;
+
+      }
+
+      reusing_restore(buf, orig_buf, g);
+      ++afl->stage_cur;
+
+    }
+
+  }
+
+done:
+
+  afl->stage_finds[STAGE_REUSING] +=
+      afl->queued_items + afl->saved_crashes - orig_hit_cnt;
+  afl->stage_cycles[STAGE_REUSING] += afl->stage_cur;
+  afl->queue_cur->stats_mutated += afl->stage_cur;
+
+  taint_map_free(m);
+
+  return ret;
 
 }

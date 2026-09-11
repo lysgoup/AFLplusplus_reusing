@@ -224,6 +224,12 @@
 
 #define HAVOC_MIN 12U
 
+/* Executions one reusing stage (-r) may spend on a queue entry. Whatever it
+   does not get through is picked up on the next visit, so this only decides
+   how finely the work is sliced. Same order as a havoc round. */
+
+#define REUSING_MAX_EXEC 256U
+
 /* Power Schedule Divisor */
 #define POWER_BETA 1U
 #define MAX_FACTOR (POWER_BETA * 32)
