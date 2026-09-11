@@ -2085,6 +2085,10 @@ static void handle_existing_out_dir(afl_state_t *afl) {
   if (rmdir(fn) && errno != ENOENT) { goto dir_cleanup_failed; }
   ck_free(fn);
 
+  fn = alloc_printf("%s/queue/signal", afl->out_dir);
+  if (delete_files(fn, NULL)) { goto dir_cleanup_failed; }
+  ck_free(fn);
+
   fn = alloc_printf("%s/queue", afl->out_dir);
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
   ck_free(fn);
