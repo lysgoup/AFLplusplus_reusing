@@ -28,6 +28,7 @@
  */
 
 #include "afl-fuzz.h"
+#include "dtaint.h"
 
 #include <ctype.h>
 
@@ -684,16 +685,345 @@ void reusing_copy_seed_taint(afl_state_t *afl, u8 *seed_name, u8 *queue_name) {
 
 }
 
-/* The reusing stage itself: rewrite `buf` at the taint offsets this input's
-   .dtaint reports, using values from the pool that share the same taint
-   pattern, and run the target on each. `orig_buf` is the pristine input to
-   restore from between mutations.
+/* ---------------------------------------------------------------------- */
+/* taint_map: one input's .dtaint -> which sites depend on which ranges.   */
+/* ---------------------------------------------------------------------- */
 
-   Returns 1 if the caller should give up on this queue entry (same contract
-   as input_to_state_stage()), 0 otherwise.
+struct tag_lookup {
 
-   Not implemented yet -- the call site exists so the gating is in place and
-   can be seen firing; the mutation work lands next. */
+  u32                         label;
+  u32                         n_segs;
+  struct dtaint_tag_seg_wire *segs;
+
+};
+
+static int cmp_tag_lookup(const void *a, const void *b) {
+
+  u32 x = ((const struct tag_lookup *)a)->label;
+  u32 y = ((const struct tag_lookup *)b)->label;
+  return (x > y) - (x < y);
+
+}
+
+static struct tag_lookup *find_tag(struct tag_lookup *tags, u32 n, u32 label) {
+
+  if (!label || !n) { return NULL; }
+
+  struct tag_lookup key = {.label = label};
+  return bsearch(&key, tags, n, sizeof(struct tag_lookup), cmp_tag_lookup);
+
+}
+
+/* Same rule as afl-taint-scan pick_primary_side(): fewer segments, lb1 on
+   tie. */
+
+static struct tag_lookup *pick_primary(struct tag_lookup *tags, u32 n, u32 lb1,
+                                       u32 lb2) {
+
+  struct tag_lookup *t1 = find_tag(tags, n, lb1), *t2 = find_tag(tags, n, lb2);
+
+  if (!t2 || !t2->n_segs) { return t1; }
+  if (t1 && t1->n_segs && t1->n_segs <= t2->n_segs) { return t1; }
+  return t2;
+
+}
+
+/* One tainted comparison before equal ranges are folded together. */
+
+struct cand_offset {
+
+  u32               offset_idx;
+  u32               n_offsets;
+  struct taint_site site;
+
+};
+
+/* Sort by taint pattern, then positions, so equal patterns are adjacent and
+   identical ranges land side by side; the site comes last so one range's
+   duplicate sites are adjacent too. */
+
+static struct cand_offset *sort_cands;
+static struct offset      *sort_offs;
+
+static int cmp_offset_key(const struct cand_offset *x,
+                          const struct cand_offset *y) {
+
+  if (x->n_offsets != y->n_offsets) {
+
+    return x->n_offsets < y->n_offsets ? -1 : 1;
+
+  }
+
+  const struct offset *ox = sort_offs + x->offset_idx;
+  const struct offset *oy = sort_offs + y->offset_idx;
+
+  for (u32 i = 0; i < x->n_offsets; i++) {
+
+    u32 lx = ox[i].end - ox[i].begin, ly = oy[i].end - oy[i].begin;
+    if (lx != ly) { return lx < ly ? -1 : 1; }
+
+  }
+
+  for (u32 i = 0; i < x->n_offsets; i++) {
+
+    if (ox[i].begin != oy[i].begin) { return ox[i].begin < oy[i].begin ? -1 : 1; }
+
+  }
+
+  return 0;
+
+}
+
+static int cmp_cand_key(const void *a, const void *b) {
+
+  const struct cand_offset *x = &sort_cands[*(const u32 *)a];
+  const struct cand_offset *y = &sort_cands[*(const u32 *)b];
+  int                       r = cmp_offset_key(x, y);
+
+  if (r) { return r; }
+
+  if (x->site.cmpid != y->site.cmpid) {
+
+    return x->site.cmpid < y->site.cmpid ? -1 : 1;
+
+  }
+
+  if (x->site.context != y->site.context) {
+
+    return x->site.context < y->site.context ? -1 : 1;
+
+  }
+
+  return 0;
+
+}
+
+/* Reads <out_dir>/taint/<queue_name>.dtaint. NULL if missing or unparsable;
+   empty map if no tainted comparison. */
+
+struct taint_map *taint_map_load(afl_state_t *afl, u8 *queue_name) {
+
+  u8 *path = alloc_printf("%s/taint/%s.dtaint", afl->out_dir, queue_name);
+  s32 fd = open((char *)path, O_RDONLY);
+
+  if (fd < 0) {
+
+    ck_free(path);
+    return NULL;
+
+  }
+
+  struct stat st;
+
+  if (fstat(fd, &st) || st.st_size < (off_t)sizeof(struct dtaint_file_header)) {
+
+    WARNF("Taint file '%s' is unreadable or too short", path);
+    close(fd);
+    ck_free(path);
+    return NULL;
+
+  }
+
+  u32 size = (u32)st.st_size;
+  u8 *buf = ck_alloc(size);
+
+  ck_read(fd, buf, size, path);
+  close(fd);
+
+  struct dtaint_file_header hdr;
+  memcpy(&hdr, buf, sizeof(hdr));
+
+  u64 conds_bytes = (u64)hdr.n_conds * sizeof(struct dtaint_cond_record_grouped);
+
+  if (hdr.magic != DTAINT_FILE_MAGIC ||
+      hdr.version != DTAINT_FILE_VERSION_GROUPED ||
+      sizeof(hdr) + conds_bytes > size) {
+
+    WARNF("Taint file '%s' is not a v%u dtaint file", path,
+          DTAINT_FILE_VERSION_GROUPED);
+    ck_free(buf);
+    ck_free(path);
+    return NULL;
+
+  }
+
+  /* Tags table: label -> ranges, pointed at in place. */
+
+  struct tag_lookup *tags = hdr.n_tags ? ck_alloc(hdr.n_tags * sizeof(struct tag_lookup)) : NULL;
+  u32                off = sizeof(hdr) + (u32)conds_bytes;
+  u32                n_tags = 0;
+
+  for (u32 i = 0; i < hdr.n_tags; i++) {
+
+    struct dtaint_tag_record rec;
+
+    if (off + sizeof(rec) > size) { break; }
+    memcpy(&rec, buf + off, sizeof(rec));
+    off += sizeof(rec);
+
+    u64 seg_bytes = (u64)rec.n_segs * sizeof(struct dtaint_tag_seg_wire);
+    if (off + seg_bytes > size) { break; }
+
+    tags[n_tags].label = rec.label;
+    tags[n_tags].n_segs = rec.n_segs;
+    tags[n_tags].segs = (struct dtaint_tag_seg_wire *)(buf + off);
+    ++n_tags;
+    off += (u32)seg_bytes;
+
+  }
+
+  if (n_tags != hdr.n_tags) {
+
+    WARNF("Taint file '%s' is truncated in its tags table", path);
+
+  }
+
+  if (n_tags) { qsort(tags, n_tags, sizeof(struct tag_lookup), cmp_tag_lookup); }
+
+  /* Candidates: one per tainted comparison, ranges copied out flat. */
+
+  struct cand_offset *cand = hdr.n_conds ? ck_alloc(hdr.n_conds * sizeof(struct cand_offset)) : NULL;
+  struct offset      *coff = NULL;
+  u32                 n_cand = 0, n_coff = 0, coff_cap = 0;
+
+  for (u32 i = 0; i < hdr.n_conds; i++) {
+
+    struct dtaint_cond_record_grouped c;
+    memcpy(&c, buf + sizeof(hdr) + (u64)i * sizeof(c), sizeof(c));
+
+    if (!c.lb1 && !c.lb2) { continue; }
+
+    struct dtaint_tag_seg_wire  one = {0, c.magic_group_begin, c.magic_group_end};
+    struct dtaint_tag_seg_wire *segs;
+    u32                         n;
+
+    if (c.magic_group_end > c.magic_group_begin) {
+
+      segs = &one;
+      n = 1;
+
+    } else {
+
+      struct tag_lookup *pr = pick_primary(tags, n_tags, c.lb1, c.lb2);
+      if (!pr || !pr->n_segs) { continue; }
+      segs = pr->segs;
+      n = pr->n_segs;
+
+    }
+
+    if (n_coff + n > coff_cap) {
+
+      coff_cap = (n_coff + n) * 2;
+      coff = ck_realloc(coff, coff_cap * sizeof(struct offset));
+
+    }
+
+    cand[n_cand].offset_idx = n_coff;
+    cand[n_cand].n_offsets = n;
+    cand[n_cand].site.cmpid = c.cmpid;
+    cand[n_cand].site.context = c.context;
+    ++n_cand;
+
+    for (u32 j = 0; j < n; j++) {
+
+      coff[n_coff].begin = segs[j].begin;
+      coff[n_coff].end = segs[j].end;
+      ++n_coff;
+
+    }
+
+  }
+
+  if (tags) { ck_free(tags); }
+  ck_free(buf);
+
+  struct taint_map *m = ck_alloc(sizeof(struct taint_map));
+
+  if (!n_cand) {
+
+    if (cand) { ck_free(cand); }
+    if (coff) { ck_free(coff); }
+    ck_free(path);
+    return m;
+
+  }
+
+  /* Order by key, then fold each run of identical ranges into one entry
+     listing the distinct sites that read them. */
+
+  u32 *idx = ck_alloc(n_cand * sizeof(u32));
+  for (u32 i = 0; i < n_cand; i++) { idx[i] = i; }
+
+  sort_cands = cand;
+  sort_offs = coff;
+  qsort(idx, n_cand, sizeof(u32), cmp_cand_key);
+
+  m->offsets = ck_alloc(n_cand * sizeof(struct offsets));
+
+  for (u32 i = 0; i < n_cand;) {
+
+    struct cand_offset *first = &cand[idx[i]];
+    struct offsets     *dst = &m->offsets[m->n_offsets++];
+    u32                 j = i;
+
+    while (j < n_cand && !cmp_offset_key(first, &cand[idx[j]])) { ++j; }
+
+    dst->n_offsets = first->n_offsets;
+    dst->offsets = ck_alloc(dst->n_offsets * sizeof(struct offset));
+    memcpy(dst->offsets, coff + first->offset_idx,
+           dst->n_offsets * sizeof(struct offset));
+
+    dst->sites = ck_alloc((j - i) * sizeof(struct taint_site));
+    dst->n_sites = 0;
+
+    /* The sort put this run's duplicate sites next to each other. */
+
+    for (; i < j; i++) {
+
+      struct taint_site *s = &cand[idx[i]].site;
+
+      if (!dst->n_sites || s->cmpid != dst->sites[dst->n_sites - 1].cmpid ||
+          s->context != dst->sites[dst->n_sites - 1].context) {
+
+        dst->sites[dst->n_sites++] = *s;
+
+      }
+
+    }
+
+    dst->sites = ck_realloc(dst->sites, dst->n_sites * sizeof(struct taint_site));
+
+  }
+
+  m->offsets = ck_realloc(m->offsets, m->n_offsets * sizeof(struct offsets));
+
+  ck_free(idx);
+  ck_free(cand);
+  ck_free(coff);
+  ck_free(path);
+
+  return m;
+
+}
+
+void taint_map_free(struct taint_map *m) {
+
+  if (!m) { return; }
+
+  for (u32 i = 0; i < m->n_offsets; i++) {
+
+    ck_free(m->offsets[i].offsets);
+    ck_free(m->offsets[i].sites);
+
+  }
+
+  if (m->offsets) { ck_free(m->offsets); }
+  ck_free(m);
+
+}
+
+/* Reusing stage: apply pool entries at this input's taint sites by taint
+   pattern. Returns 1 to abandon the entry. Mutation not implemented yet. */
 
 u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
@@ -702,8 +1032,48 @@ u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
   if (afl->debug) {
 
-    fprintf(stderr, "[D] reusing_stage: '%s' len=%u pool=%u\n",
-            afl->queue_cur->fname, len, afl->value_pool_cnt);
+    u8               *qn = strrchr((char *)afl->queue_cur->fname, '/');
+    struct taint_map *m = taint_map_load(afl, qn ? qn + 1 : afl->queue_cur->fname);
+
+    if (m) {
+
+      u32 pats = m->n_offsets ? 1 : 0, ranges = 0, sites = 0;
+
+      for (u32 i = 0; i < m->n_offsets; i++) {
+
+        struct offsets *b = &m->offsets[i];
+
+        ranges += b->n_offsets;
+        sites += b->n_sites;
+
+        if (!i) { continue; }
+
+        struct offsets *a = &m->offsets[i - 1];
+        u8              same = a->n_offsets == b->n_offsets;
+
+        for (u32 k = 0; same && k < a->n_offsets; k++) {
+
+          same = (a->offsets[k].end - a->offsets[k].begin) ==
+                 (b->offsets[k].end - b->offsets[k].begin);
+
+        }
+
+        if (!same) { ++pats; }
+
+      }
+
+      fprintf(stderr,
+              "[D] reusing_stage: '%s' len=%u offsets=%u ranges=%u sites=%u "
+              "patterns=%u\n",
+              afl->queue_cur->fname, len, m->n_offsets, ranges, sites, pats);
+      taint_map_free(m);
+
+    } else {
+
+      fprintf(stderr, "[D] reusing_stage: '%s' len=%u (no taint file)\n",
+              afl->queue_cur->fname, len);
+
+    }
 
   }
 

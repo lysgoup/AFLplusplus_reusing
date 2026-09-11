@@ -401,6 +401,46 @@ struct unsolved_set {
 
 };
 
+/* Input byte range [begin, end). */
+
+struct offset {
+
+  u32 begin;
+  u32 end;
+
+};
+
+/* A comparison, keyed the way unsolved sites are. */
+
+struct taint_site {
+
+  u32 cmpid;
+  u32 context;
+
+};
+
+/* The ranges one mutation rewrites together; their lengths are its taint
+   pattern. Sites that read exactly these ranges share one of these, and are
+   all listed in it. */
+
+struct offsets {
+
+  struct offset     *offsets;
+  u32                n_offsets;
+  struct taint_site *sites;
+  u32                n_sites;
+
+};
+
+/* One input's parsed .dtaint, sorted by taint pattern. */
+
+struct taint_map {
+
+  struct offsets *offsets;
+  u32             n_offsets;
+
+};
+
 /* Fuzzing stages */
 enum {
 
@@ -1466,6 +1506,9 @@ void destroy_extras(afl_state_t *);
 void load_reusing_data(afl_state_t *);
 void destroy_reusing_data(afl_state_t *);
 void reusing_copy_seed_taint(afl_state_t *, u8 *, u8 *);
+
+struct taint_map *taint_map_load(afl_state_t *, u8 *);
+void              taint_map_free(struct taint_map *);
 
 struct unsolved_site *unsolved_lookup(struct unsolved_set *, u32, u32);
 struct unsolved_site *unsolved_insert(struct unsolved_set *, u32, u32, s32);
