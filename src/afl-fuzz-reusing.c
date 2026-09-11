@@ -671,7 +671,8 @@ void load_reusing_data(afl_state_t *afl) {
 
   if (!afl->reusing_mode) { return; }
 
-  ACTF("Loading reusing taint data from '%s'...", afl->reusing_dir);
+  ACTF("Loading reusing taint data from '%s' (trimming is off)...",
+       afl->reusing_dir);
 
   load_value_pool(afl);
   load_unsolved_sites(afl);

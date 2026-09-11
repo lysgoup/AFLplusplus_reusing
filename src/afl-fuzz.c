@@ -1070,6 +1070,11 @@ void afl_parse_commandline(afl_state_t *afl, int argc, char **argv) {
           afl->reusing_mode = 1;
           afl->reusing_dir = optarg;
 
+          /* Trimming rewrites the queue entry, and every offset in its
+             .dtaint then points at the wrong byte. Until the taint analysis
+             runs inside the fuzzer, after trimming, the two cannot coexist. */
+          afl->disable_trim = 1;
+
         }
 
         break;
