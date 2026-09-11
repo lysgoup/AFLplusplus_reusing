@@ -332,6 +332,12 @@ struct queue_entry {
                                            offsets of this input's taint
                                            map (-r)                         */
   u32  reusing_cnt;                     /* How many offsets it covers       */
+  u8   reusing_done;                    /* Nothing left to try, so the stage
+                                           can skip reading the .dtaint at
+                                           all. Must be cleared for every
+                                           entry once the value pool can
+                                           gain values or a site can go back
+                                           to unsolved                      */
 
 };
 

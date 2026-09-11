@@ -1239,6 +1239,12 @@ static void reusing_restore(u8 *buf, u8 *orig_buf, struct offsets *g) {
 
 u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
+  /* Everything below needs the .dtaint parsed just to find out there is
+     nothing to do, so remember that answer instead of reaching the same
+     conclusion on every visit. */
+
+  if (afl->queue_cur->reusing_done) { return 0; }
+
   u8               *qn = strrchr((char *)afl->queue_cur->fname, '/');
   struct taint_map *m = taint_map_load(afl, qn ? qn + 1 : afl->queue_cur->fname);
 
@@ -1251,6 +1257,7 @@ u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
     }
 
+    afl->queue_cur->reusing_done = 1;
     return 0;
 
   }
@@ -1274,34 +1281,32 @@ u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
   u32 *cur = afl->queue_cur->reusing_cur;
 
-  /* What is left to try, so the UI has a total to count against. */
+  /* Everything still untried, so the UI has a total to count against and
+     this visit can tell whether it will get through all of it. */
 
-  afl->stage_max = 0;
+  u32 remaining = 0;
 
   for (u32 i = 0; i < m->n_offsets; i++) {
 
     struct offsets      *g = &m->offsets[i];
     struct value_bucket *b = reusing_bucket(afl, g, len);
 
-    if (b && cur[g->idx] < b->n_entries) {
-
-      afl->stage_max += b->n_entries - cur[g->idx];
-
-    }
+    if (b && cur[g->idx] < b->n_entries) { remaining += b->n_entries - cur[g->idx]; }
 
   }
 
-  if (afl->stage_max > REUSING_MAX_EXEC) { afl->stage_max = REUSING_MAX_EXEC; }
+  afl->stage_max = MIN(remaining, (u32)REUSING_MAX_EXEC);
 
   if (afl->debug) {
 
-    fprintf(stderr, "[D] reusing_stage: '%s' len=%u offsets=%u execs=%u\n",
-            afl->queue_cur->fname, len, m->n_offsets, afl->stage_max);
+    fprintf(stderr, "[D] reusing_stage: '%s' len=%u offsets=%u execs=%u/%u\n",
+            afl->queue_cur->fname, len, m->n_offsets, afl->stage_max, remaining);
 
   }
 
   if (!afl->stage_max) {
 
+    afl->queue_cur->reusing_done = 1;
     taint_map_free(m);
     return 0;
 
@@ -1341,6 +1346,10 @@ u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
   }
 
 done:
+
+  /* The budget covered all of it, so the cursors are now at the end. */
+
+  if (!ret && remaining <= REUSING_MAX_EXEC) { afl->queue_cur->reusing_done = 1; }
 
   afl->stage_finds[STAGE_REUSING] +=
       afl->queued_items + afl->saved_crashes - orig_hit_cnt;
