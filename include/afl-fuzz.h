@@ -1508,6 +1508,7 @@ void destroy_reusing_data(afl_state_t *);
 void reusing_copy_seed_taint(afl_state_t *, u8 *, u8 *);
 
 struct taint_map *taint_map_load(afl_state_t *, u8 *);
+void              taint_map_filter_unsolved(afl_state_t *, struct taint_map *);
 void              taint_map_free(struct taint_map *);
 
 struct unsolved_site *unsolved_lookup(struct unsolved_set *, u32, u32);

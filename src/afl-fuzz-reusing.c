@@ -1006,6 +1006,48 @@ struct taint_map *taint_map_load(afl_state_t *afl, u8 *queue_name) {
 
 }
 
+/* Drops the sites that are no longer unsolved, and with them the entries
+   left without any. Order is kept, so equal taint patterns stay adjacent. */
+
+void taint_map_filter_unsolved(afl_state_t *afl, struct taint_map *m) {
+
+  if (!m) { return; }
+
+  u32 n = 0;
+
+  for (u32 i = 0; i < m->n_offsets; i++) {
+
+    struct offsets *src = &m->offsets[i];
+    u32             kept = 0;
+
+    for (u32 j = 0; j < src->n_sites; j++) {
+
+      if (unsolved_lookup(&afl->unsolved, src->sites[j].cmpid,
+                          src->sites[j].context)) {
+
+        src->sites[kept++] = src->sites[j];
+
+      }
+
+    }
+
+    if (!kept) {
+
+      ck_free(src->offsets);
+      ck_free(src->sites);
+      continue;
+
+    }
+
+    src->n_sites = kept;
+    m->offsets[n++] = *src;
+
+  }
+
+  m->n_offsets = n;
+
+}
+
 void taint_map_free(struct taint_map *m) {
 
   if (!m) { return; }
@@ -1036,6 +1078,8 @@ u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
     struct taint_map *m = taint_map_load(afl, qn ? qn + 1 : afl->queue_cur->fname);
 
     if (m) {
+
+      taint_map_filter_unsolved(afl, m);
 
       u32 pats = m->n_offsets ? 1 : 0, ranges = 0, sites = 0;
 
