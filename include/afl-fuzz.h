@@ -375,6 +375,19 @@ struct value_pool_entry {
 
 };
 
+/* Every value pool entry sharing one taint pattern. Entries are only ever
+   appended, so an index into them stays meaningful as the pool grows --
+   that is what lets a queue entry resume where it left off. */
+
+struct value_bucket {
+
+  u32                     *lens;        /* The taint pattern                */
+  u32                      n_lens;      /* == every entry's n_segs          */
+  struct value_pool_entry *entries;
+  u32                      n_entries;
+
+};
+
 /* One line of unsolved_condition (-r): a comparison site that has only ever
    gone one way. Keyed on the pair, since a site can be solved under one call
    context and still open under another. */
@@ -943,8 +956,9 @@ typedef struct afl_state {
   /* Reusing (-r): afl-taint-scan's output, loaded once at startup. */
 
   u8                       reusing_mode;    /* -r given (and not '-r -')    */
-  struct value_pool_entry *value_pool;      /* value_pool.dict, one per line*/
-  u32                      value_pool_cnt;  /* Entries loaded               */
+  struct value_bucket     *value_pool;      /* value_pool.dict by pattern   */
+  u32                      value_pool_cnt;  /* Buckets                      */
+  u32                      value_pool_entries; /* Entries across buckets    */
   u32                      value_pool_segs; /* Segments across all entries  */
   struct unsolved_set      unsolved;        /* unsolved_condition           */
   u32                      taint_success;   /* seeds with a pool .dtaint    */
@@ -1506,6 +1520,8 @@ void destroy_extras(afl_state_t *);
 void load_reusing_data(afl_state_t *);
 void destroy_reusing_data(afl_state_t *);
 void reusing_copy_seed_taint(afl_state_t *, u8 *, u8 *);
+
+struct value_bucket *value_pool_find(afl_state_t *, u32 *, u32);
 
 struct taint_map *taint_map_load(afl_state_t *, u8 *);
 void              taint_map_filter_unsolved(afl_state_t *, struct taint_map *);

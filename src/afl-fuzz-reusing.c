@@ -178,6 +178,29 @@ bad_line:
 
 }
 
+/* Orders entries by taint pattern: segment count, then each length. Equal
+   under this comparison means the same pattern, which is what a bucket is. */
+
+static int cmp_pool_entry(const void *a, const void *b) {
+
+  const struct value_pool_entry *x = a, *y = b;
+
+  if (x->n_segs != y->n_segs) { return x->n_segs < y->n_segs ? -1 : 1; }
+
+  for (u32 i = 0; i < x->n_segs; i++) {
+
+    if (x->segs[i].len != y->segs[i].len) {
+
+      return x->segs[i].len < y->segs[i].len ? -1 : 1;
+
+    }
+
+  }
+
+  return 0;
+
+}
+
 /* value_pool.dict -> afl->value_pool. */
 
 static void load_value_pool(afl_state_t *afl) {
@@ -194,6 +217,9 @@ static void load_value_pool(afl_state_t *afl) {
   u8 *line = ck_alloc(REUSING_MAX_LINE);
   u8 *segbuf = ck_alloc(REUSING_MAX_SEG_LEN);
   u32 malformed = 0, cur_line = 0;
+
+  struct value_pool_entry *flat = NULL;
+  u32                      n_flat = 0;
 
   while (fgets((char *)line, REUSING_MAX_LINE, f)) {
 
@@ -237,10 +263,8 @@ static void load_value_pool(afl_state_t *afl) {
 
     }
 
-    afl->value_pool = ck_realloc(
-        afl->value_pool,
-        (afl->value_pool_cnt + 1) * sizeof(struct value_pool_entry));
-    afl->value_pool[afl->value_pool_cnt++] = entry;
+    flat = ck_realloc(flat, (n_flat + 1) * sizeof(struct value_pool_entry));
+    flat[n_flat++] = entry;
     afl->value_pool_segs += entry.n_segs;
 
   }
@@ -249,6 +273,43 @@ static void load_value_pool(afl_state_t *afl) {
   ck_free(line);
   ck_free(segbuf);
 
+  /* Group the entries by taint pattern. Sorting first puts equal patterns
+     next to each other, so one pass builds the buckets. */
+
+  if (n_flat) {
+
+    qsort(flat, n_flat, sizeof(struct value_pool_entry), cmp_pool_entry);
+
+    afl->value_pool = ck_alloc(n_flat * sizeof(struct value_bucket));
+
+    for (u32 i = 0; i < n_flat;) {
+
+      struct value_bucket *b = &afl->value_pool[afl->value_pool_cnt++];
+      u32                  j = i;
+
+      while (j < n_flat && !cmp_pool_entry(&flat[i], &flat[j])) { ++j; }
+
+      b->n_lens = flat[i].n_segs;
+      b->lens = ck_alloc(b->n_lens * sizeof(u32));
+
+      for (u32 k = 0; k < b->n_lens; k++) { b->lens[k] = flat[i].segs[k].len; }
+
+      b->n_entries = j - i;
+      b->entries = ck_alloc(b->n_entries * sizeof(struct value_pool_entry));
+      memcpy(b->entries, flat + i, b->n_entries * sizeof(struct value_pool_entry));
+
+      i = j;
+
+    }
+
+    afl->value_pool =
+        ck_realloc(afl->value_pool, afl->value_pool_cnt * sizeof(struct value_bucket));
+    ck_free(flat);
+
+  }
+
+  afl->value_pool_entries = n_flat;
+
   if (malformed) {
 
     WARNF("Skipped %u malformed value pool entr%s.", malformed,
@@ -256,9 +317,11 @@ static void load_value_pool(afl_state_t *afl) {
 
   }
 
-  OKF("Loaded %u value pool entr%s (%u segments) from '%s'.",
-      afl->value_pool_cnt, afl->value_pool_cnt == 1 ? "y" : "ies",
-      afl->value_pool_segs, fname);
+  OKF("Loaded %u value pool entr%s (%u segments, %u taint pattern%s) from "
+      "'%s'.",
+      afl->value_pool_entries, afl->value_pool_entries == 1 ? "y" : "ies",
+      afl->value_pool_segs, afl->value_pool_cnt,
+      afl->value_pool_cnt == 1 ? "" : "s", fname);
 
   /* Re-emit what we decoded, in the file's own escaping, so it can be
      diffed straight against value_pool.dict -- the entry and segment counts
@@ -266,14 +329,18 @@ static void load_value_pool(afl_state_t *afl) {
 
   if (afl->debug) {
 
-    for (u32 i = 0; i < afl->value_pool_cnt; i++) {
+    for (u32 i = 0, n = 0; i < afl->value_pool_cnt; i++) {
 
-      fprintf(stderr, "[D] value_pool[%u] = [", i);
+     for (u32 e = 0; e < afl->value_pool[i].n_entries; e++, n++) {
 
-      for (u32 s = 0; s < afl->value_pool[i].n_segs; s++) {
+      struct value_pool_entry *ent = &afl->value_pool[i].entries[e];
 
-        u8 *d = afl->value_pool[i].segs[s].data;
-        u32 l = afl->value_pool[i].segs[s].len;
+      fprintf(stderr, "[D] value_pool[%u] = [", n);
+
+      for (u32 s = 0; s < ent->n_segs; s++) {
+
+        u8 *d = ent->segs[s].data;
+        u32 l = ent->segs[s].len;
 
         if (s) { fputc(',', stderr); }
         fputc('"', stderr);
@@ -302,11 +369,49 @@ static void load_value_pool(afl_state_t *afl) {
 
       fprintf(stderr, "]\n");
 
+     }
+
     }
 
   }
 
   ck_free(fname);
+
+}
+
+/* The bucket for a taint pattern, or NULL if the pool has no value of that
+   shape. */
+
+struct value_bucket *value_pool_find(afl_state_t *afl, u32 *lens, u32 n_lens) {
+
+  u32 lo = 0, hi = afl->value_pool_cnt;
+
+  while (lo < hi) {
+
+    u32                  mid = lo + (hi - lo) / 2;
+    struct value_bucket *b = &afl->value_pool[mid];
+    int                  r = 0;
+
+    if (b->n_lens != n_lens) {
+
+      r = b->n_lens < n_lens ? -1 : 1;
+
+    } else {
+
+      for (u32 i = 0; i < n_lens && !r; i++) {
+
+        if (b->lens[i] != lens[i]) { r = b->lens[i] < lens[i] ? -1 : 1; }
+
+      }
+
+    }
+
+    if (!r) { return b; }
+    if (r < 0) { lo = mid + 1; } else { hi = mid; }
+
+  }
+
+  return NULL;
 
 }
 
@@ -577,13 +682,22 @@ void destroy_reusing_data(afl_state_t *afl) {
 
   for (u32 i = 0; i < afl->value_pool_cnt; i++) {
 
-    for (u32 s = 0; s < afl->value_pool[i].n_segs; s++) {
+    struct value_bucket *b = &afl->value_pool[i];
 
-      ck_free(afl->value_pool[i].segs[s].data);
+    for (u32 e = 0; e < b->n_entries; e++) {
+
+      for (u32 s = 0; s < b->entries[e].n_segs; s++) {
+
+        ck_free(b->entries[e].segs[s].data);
+
+      }
+
+      ck_free(b->entries[e].segs);
 
     }
 
-    ck_free(afl->value_pool[i].segs);
+    ck_free(b->entries);
+    ck_free(b->lens);
 
   }
 
@@ -591,6 +705,7 @@ void destroy_reusing_data(afl_state_t *afl) {
 
   afl->value_pool = NULL;
   afl->value_pool_cnt = 0;
+  afl->value_pool_entries = 0;
   afl->value_pool_segs = 0;
 
   if (afl->unsolved.slots) { ck_free(afl->unsolved.slots); }
