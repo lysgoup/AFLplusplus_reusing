@@ -886,6 +886,8 @@ typedef struct afl_state {
   u32                      value_pool_segs; /* Segments across all entries  */
   u32                     *unsolved_cmpids; /* sorted, for bsearch()        */
   u32                      unsolved_cmpids_cnt;
+  u32                      taint_success;   /* seeds with a pool .dtaint    */
+  u32                      taint_missing;   /* seeds without one            */
 
   /* ASAN Fuzing */
   char            *san_binary[MAX_EXTRA_SAN_BINARY];
@@ -1442,6 +1444,7 @@ void destroy_extras(afl_state_t *);
 
 void load_reusing_data(afl_state_t *);
 void destroy_reusing_data(afl_state_t *);
+void reusing_copy_seed_taint(afl_state_t *, u8 *, u8 *);
 u8   reusing_stage(afl_state_t *, u8 *, u8 *, u32);
 
 /* Stats */

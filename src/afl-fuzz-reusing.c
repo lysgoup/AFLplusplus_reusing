@@ -450,6 +450,92 @@ void destroy_reusing_data(afl_state_t *afl) {
 
 }
 
+/* Brings a dry-run seed's precomputed .dtaint across from the -r pool into
+   <out_dir>/taint/, renaming it from the seed's own filename (which is how
+   afl-taint-scan keyed it) to the name the entry just got in the queue.
+   Everything downstream then looks taint data up by queue entry name alone,
+   with no need to know whether an entry came from a seed or was discovered
+   later.
+
+   Called from perform_dry_run()'s pivot, where both names are still in hand
+   -- a moment later q->fname is overwritten with the queue path and the
+   seed's own name is gone.
+
+   A seed with no .dtaint is normal, not an error: afl-taint-scan writes no
+   track file for an input the target had nothing taint-worthy to say about.
+   Counted so the dry-run summary can show the real coverage. */
+
+void reusing_copy_seed_taint(afl_state_t *afl, u8 *seed_name, u8 *queue_name) {
+
+  u8 *src = alloc_printf("%s/%s.dtaint", afl->reusing_dir, seed_name);
+
+  if (access((char *)src, R_OK)) {
+
+    ++afl->taint_missing;
+    ck_free(src);
+    return;
+
+  }
+
+  u8 *dst = alloc_printf("%s/taint/%s.dtaint", afl->out_dir, queue_name);
+
+  /* Hard link first: the pool is read-only and shared by every trial of
+     every campaign against this corpus, so not duplicating gigabytes of
+     track files per campaign is worth a try. Falls back to a copy when the
+     pool is on another filesystem (the usual case under Docker, where it is
+     a separate read-only bind mount). */
+
+  if (link((char *)src, (char *)dst)) {
+
+    s32 sfd = open((char *)src, O_RDONLY);
+    s32 dfd = sfd < 0
+                  ? -1
+                  : open((char *)dst, O_WRONLY | O_CREAT | O_TRUNC, afl->perm);
+
+    if (sfd < 0 || dfd < 0) {
+
+      WARNF("Could not copy taint data '%s' -> '%s': %s", src, dst,
+            strerror(errno));
+      if (sfd >= 0) { close(sfd); }
+      ++afl->taint_missing;
+      ck_free(src);
+      ck_free(dst);
+      return;
+
+    }
+
+    u8 *buf = ck_alloc(64 * 1024);
+    ssize_t rd;
+
+    while ((rd = read(sfd, buf, 64 * 1024)) > 0) {
+
+      ck_write(dfd, buf, rd, dst);
+
+    }
+
+    ck_free(buf);
+    close(sfd);
+    close(dfd);
+
+    if (rd < 0) {
+
+      WARNF("Short read on taint data '%s': %s", src, strerror(errno));
+      ++afl->taint_missing;
+      ck_free(src);
+      ck_free(dst);
+      return;
+
+    }
+
+  }
+
+  ++afl->taint_success;
+
+  ck_free(src);
+  ck_free(dst);
+
+}
+
 /* The reusing stage itself: rewrite `buf` at the taint offsets this input's
    .dtaint reports, using values from the pool that share the same taint
    pattern, and run the target on each. `orig_buf` is the pristine input to

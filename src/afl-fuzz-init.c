@@ -1681,6 +1681,18 @@ void pivot_inputs(afl_state_t *afl) {
     /* Pivot to the new queue entry. */
 
     link_or_copy(q->fname, nfn, afl->perm);
+
+    /* Do the same for this seed's taint data, while the seed's own name
+       (rsl) and the queue name are both still available -- q->fname is
+       about to become the queue path. */
+
+    if (unlikely(afl->reusing_mode)) {
+
+      u8 *qrsl = strrchr(nfn, '/');
+      reusing_copy_seed_taint(afl, rsl, qrsl ? qrsl + 1 : nfn);
+
+    }
+
     ck_free(q->fname);
     q->fname = nfn;
 
@@ -1702,6 +1714,15 @@ void pivot_inputs(afl_state_t *afl) {
     }
 
     ++id;
+
+  }
+
+  if (unlikely(afl->reusing_mode)) {
+
+    u32 total = afl->taint_success + afl->taint_missing;
+
+    OKF("Taint data for %u/%u seed%s (%u had none in the pool).",
+        afl->taint_success, total, total == 1 ? "" : "s", afl->taint_missing);
 
   }
 
@@ -2093,6 +2114,10 @@ static void handle_existing_out_dir(afl_state_t *afl) {
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
   ck_free(fn);
 
+  fn = alloc_printf("%s/taint", afl->out_dir);
+  if (delete_files(fn, NULL)) { goto dir_cleanup_failed; }
+  ck_free(fn);
+
   /* All right, let's do <afl->out_dir>/crashes/id:* and
    * <afl->out_dir>/hangs/id:*. */
 
@@ -2429,6 +2454,19 @@ void setup_dirs_fds(afl_state_t *afl) {
   tmp = alloc_printf("%s/queue/.state/variable/", afl->out_dir);
   if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
   ck_free(tmp);
+
+  /* Per-queue-entry taint data (-r). Keyed by queue entry name rather than
+     by the seed's own, so whatever produced a .dtaint -- copied out of the
+     -r pool for a dry-run seed, or derived later for a fuzzer discovery --
+     is looked up the same way. */
+
+  if (afl->reusing_mode) {
+
+    tmp = alloc_printf("%s/taint", afl->out_dir);
+    if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
+    ck_free(tmp);
+
+  }
 
   /* Sync directory for keeping track of cooperating fuzzers. */
 
