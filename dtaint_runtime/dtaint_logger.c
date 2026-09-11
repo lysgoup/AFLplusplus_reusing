@@ -54,13 +54,17 @@ static int cond_list_push(struct dtaint_cond_record *c) {
 /* label the first time any cond references it (mirrors Logger::save_tag).*/
 /* ---------------------------------------------------------------------- */
 
-#define TAG_SEGS_CAP 32
+/* Scratch buffer save_tag() resolves a label into before sizing the real
+   allocation. 4096 matches dtaint_tagset_find()'s own internal cap -- it
+   never writes more than that many segments no matter what `cap` says, so a
+   larger scratch would be dead space. */
+#define TAG_SEGS_SCRATCH 4096
 
 typedef struct {
 
-  u32              label;
-  u32              n_segs;
-  dtaint_tag_seg_t segs[TAG_SEGS_CAP];
+  u32               label;
+  u32               n_segs;
+  dtaint_tag_seg_t *segs;
 
 } tag_entry_t;
 
@@ -110,10 +114,35 @@ static void save_tag(u32 lb) {
 
   }
 
+  /* Resolve into the shared scratch first, then allocate exactly what this
+     label needs. find() reports the true segment count even when it wrote
+     fewer (see its cap contract), so one pass is enough to size the
+     allocation -- no grow-as-you-go realloc, and no fixed per-label array
+     either. The old fixed segs[32] was truncating here: measured on the
+     saturated seed corpora, labels piled up at exactly 32 segments (jq:
+     7694 of them), i.e. real spans were being thrown away. Angora's own
+     Logger::save_tag stores TagSet::find()'s whole Vec with no cap, so this
+     also removes a fidelity gap, and it costs less memory than before --
+     most labels resolve to 3-9 segments, where the fixed array always paid
+     for 32. */
+
+  static dtaint_tag_seg_t scratch[TAG_SEGS_SCRATCH];
+
+  u32 n = dtaint_tagset_find(lb, scratch, TAG_SEGS_SCRATCH);
+  if (n > TAG_SEGS_SCRATCH) n = TAG_SEGS_SCRATCH;
+
   tag_entry_t *e = &tags[tags_len++];
   e->label = lb;
-  e->n_segs = dtaint_tagset_find(lb, e->segs, TAG_SEGS_CAP);
-  if (e->n_segs > TAG_SEGS_CAP) e->n_segs = TAG_SEGS_CAP; /* see find()'s cap contract */
+  e->n_segs = n;
+  e->segs = NULL;
+
+  if (n) {
+
+    e->segs = malloc((size_t)n * sizeof(dtaint_tag_seg_t));
+    if (!e->segs) abort();
+    memcpy(e->segs, scratch, (size_t)n * sizeof(dtaint_tag_seg_t));
+
+  }
 
 }
 
