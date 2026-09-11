@@ -320,7 +320,7 @@ static int cmp_unsolved_site(const void *a, const void *b) {
 }
 
 /* unsolved_condition -> afl->unsolved, deduped and sorted. Lines look like
-   "cmpid=<n> context=<n>". */
+   "cmpid=<n> context=<n> seen=<n>". */
 
 static void load_unsolved_sites(afl_state_t *afl) {
 
@@ -340,6 +340,7 @@ static void load_unsolved_sites(afl_state_t *afl) {
   while (fgets((char *)line, REUSING_MAX_UNSOLVED_LINE, f)) {
 
     u32 cmpid, context;
+    s32 seen;
 
     /* Same fgets() split as above. Harmless here -- a tail fragment simply
        fails the sscanf() below -- but count it so a silently ignored file
@@ -358,7 +359,8 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
     if (line[0] == '#') { continue; }
 
-    if (sscanf((char *)line, "cmpid=%u context=%u", &cmpid, &context) != 2) {
+    if (sscanf((char *)line, "cmpid=%u context=%u seen=%d", &cmpid, &context,
+               &seen) != 3) {
 
       continue;
 
@@ -375,6 +377,7 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
     sites[n].cmpid = cmpid;
     sites[n].context = context;
+    sites[n].seen = seen;
     ++n;
 
   }
@@ -412,6 +415,11 @@ static void load_unsolved_sites(afl_state_t *afl) {
     sites = ck_realloc(sites, n * sizeof(struct unsolved_site));
 
   }
+
+  /* A pool written before `seen` existed parses as zero lines, which would
+     otherwise look exactly like a target with nothing left unsolved. */
+
+  if (!n) { FATAL("No usable lines in '%s' -- regenerate it with afl-taint-scan", fname); }
 
   afl->unsolved = sites;
   afl->unsolved_cnt = n;

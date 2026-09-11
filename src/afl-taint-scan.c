@@ -893,6 +893,9 @@ static void unsolved_write(cond_status_set_t *s, const char *path) {
 
   fprintf(f, "# unsolved conditions -- %u of %u tracked site(s) never seen both ways "
              "(cmpid, context)\n", n_unsolved, s->count);
+  fprintf(f, "# seen = the one condition value ever produced here (%u false, "
+             "%u true, %u done), or -1 if there was no single one\n",
+          DTAINT_COND_FALSE_ST, DTAINT_COND_TRUE_ST, DTAINT_COND_DONE_ST);
 
   for (u32 i = 0; i < s->cap; i++) {
 
@@ -903,7 +906,13 @@ static void unsolved_write(cond_status_set_t *s, const char *path) {
     u8 solved = !is_switch && slot->n_distinct >= 2;
     if (solved) continue;
 
-    fprintf(f, "cmpid=%u context=%u\n", slot->cmpid, slot->context);
+    /* Which way it went says which direction a mutation has to push. A
+       switch is reported unsolved even after taking several cases, so it
+       need not have a single direction. */
+    s32 seen = slot->n_distinct == 1 ? (s32)slot->seen_conditions[0] : -1;
+
+    fprintf(f, "cmpid=%u context=%u seen=%d\n", slot->cmpid, slot->context,
+            seen);
 
   }
 

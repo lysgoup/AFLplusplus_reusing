@@ -383,6 +383,8 @@ struct unsolved_site {
 
   u32 cmpid;
   u32 context;
+  s32 seen;                             /* the one condition value seen, or
+                                           -1 if there was no single one    */
 
 };
 
