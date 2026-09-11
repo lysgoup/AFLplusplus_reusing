@@ -309,17 +309,137 @@ static void load_value_pool(afl_state_t *afl) {
 
 }
 
-static int cmp_unsolved_site(const void *a, const void *b) {
+/* ---------------------------------------------------------------------- */
+/* unsolved_set: open addressing, linear probing, power-of-two capacity,   */
+/* kept under 3/4 full. Same hash afl-taint-scan's cond_status_hash() uses */
+/* for the same key.                                                        */
+/* ---------------------------------------------------------------------- */
 
-  const struct unsolved_site *x = a, *y = b;
+static inline u32 unsolved_hash(u32 cmpid, u32 context) {
 
-  if (x->cmpid != y->cmpid) { return x->cmpid < y->cmpid ? -1 : 1; }
-  if (x->context != y->context) { return x->context < y->context ? -1 : 1; }
-  return 0;
+  return cmpid * 2654435761u ^ context;
 
 }
 
-/* unsolved_condition -> afl->unsolved, deduped and sorted. Lines look like
+/* Index of the slot holding (cmpid, context), or of the empty slot where it
+   would go. Terminates because the set is never full. */
+
+static u32 unsolved_probe(struct unsolved_set *s, u32 cmpid, u32 context) {
+
+  u32 mask = s->cap - 1;
+  u32 idx = unsolved_hash(cmpid, context) & mask;
+
+  while (s->slots[idx].used &&
+         (s->slots[idx].cmpid != cmpid || s->slots[idx].context != context)) {
+
+    idx = (idx + 1) & mask;
+
+  }
+
+  return idx;
+
+}
+
+static void unsolved_grow(struct unsolved_set *s) {
+
+  struct unsolved_site *old = s->slots;
+  u32                   old_cap = s->cap;
+
+  s->cap = old_cap ? old_cap * 2 : 1024;
+  s->slots = ck_alloc(s->cap * sizeof(struct unsolved_site));
+
+  for (u32 i = 0; i < old_cap; i++) {
+
+    if (old[i].used) {
+
+      s->slots[unsolved_probe(s, old[i].cmpid, old[i].context)] = old[i];
+
+    }
+
+  }
+
+  if (old) { ck_free(old); }
+
+}
+
+struct unsolved_site *unsolved_lookup(struct unsolved_set *s, u32 cmpid,
+                                      u32 context) {
+
+  if (!s->cnt) { return NULL; }
+
+  struct unsolved_site *slot = &s->slots[unsolved_probe(s, cmpid, context)];
+
+  return slot->used ? slot : NULL;
+
+}
+
+/* Returns the site's slot, inserting it with `seen` if it was not there.
+   Check s->cnt around the call to tell the two apart. */
+
+struct unsolved_site *unsolved_insert(struct unsolved_set *s, u32 cmpid,
+                                      u32 context, s32 seen) {
+
+  if ((u64)(s->cnt + 1) * 4 > (u64)s->cap * 3) { unsolved_grow(s); }
+
+  struct unsolved_site *slot = &s->slots[unsolved_probe(s, cmpid, context)];
+
+  if (!slot->used) {
+
+    slot->cmpid = cmpid;
+    slot->context = context;
+    slot->seen = seen;
+    slot->used = 1;
+    ++s->cnt;
+
+  }
+
+  return slot;
+
+}
+
+/* Backward-shift deletion: after emptying the slot, walk the probe run that
+   follows it and pull back any entry whose home position lies at or before
+   the hole, so no lookup ever hits a false empty slot. No tombstones, so
+   heavy churn never degrades the table. Returns 1 if the site was there. */
+
+u8 unsolved_remove(struct unsolved_set *s, u32 cmpid, u32 context) {
+
+  if (!s->cnt) { return 0; }
+
+  u32 mask = s->cap - 1;
+  u32 hole = unsolved_probe(s, cmpid, context);
+
+  if (!s->slots[hole].used) { return 0; }
+
+  s->slots[hole].used = 0;
+  --s->cnt;
+
+  u32 j = hole;
+
+  while (1) {
+
+    j = (j + 1) & mask;
+
+    if (!s->slots[j].used) { break; }
+
+    u32 home = unsolved_hash(s->slots[j].cmpid, s->slots[j].context) & mask;
+
+    /* Movable iff home is not strictly inside (hole, j] cyclically. */
+    if (((j - home) & mask) >= ((j - hole) & mask)) {
+
+      s->slots[hole] = s->slots[j];
+      s->slots[j].used = 0;
+      hole = j;
+
+    }
+
+  }
+
+  return 1;
+
+}
+
+/* unsolved_condition -> afl->unsolved. Lines look like
    "cmpid=<n> context=<n> seen=<n>". */
 
 static void load_unsolved_sites(afl_state_t *afl) {
@@ -333,9 +453,8 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
   }
 
-  u8                   *line = ck_alloc(REUSING_MAX_UNSOLVED_LINE);
-  u32                   cap = 0, n = 0, lines = 0, overlong = 0;
-  struct unsolved_site *sites = NULL;
+  u8 *line = ck_alloc(REUSING_MAX_UNSOLVED_LINE);
+  u32 lines = 0, overlong = 0, dup = 0;
 
   while (fgets((char *)line, REUSING_MAX_UNSOLVED_LINE, f)) {
 
@@ -368,17 +487,24 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
     ++lines;
 
-    if (n == cap) {
+    u32                   before = afl->unsolved.cnt;
+    struct unsolved_site *slot =
+        unsolved_insert(&afl->unsolved, cmpid, context, seen);
 
-      cap = cap ? cap * 2 : 1024;
-      sites = ck_realloc(sites, cap * sizeof(struct unsolved_site));
+    if (afl->unsolved.cnt == before) {
+
+      /* Same site twice should not happen; a disagreeing `seen` would mean
+         the writer is inconsistent, which is worth hearing about. */
+      if (slot->seen != seen && dup < 5) {
+
+        WARNF("Site cmpid=%u context=%u listed twice with seen=%d and seen=%d",
+              cmpid, context, slot->seen, seen);
+
+      }
+
+      ++dup;
 
     }
-
-    sites[n].cmpid = cmpid;
-    sites[n].context = context;
-    sites[n].seen = seen;
-    ++n;
 
   }
 
@@ -392,40 +518,44 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
   }
 
-  /* Sorted so lookups can bsearch(); deduped in case the file ever repeats a
-     pair. */
+  if (dup) { WARNF("Skipped %u duplicate unsolved site%s.", dup, dup == 1 ? "" : "s"); }
 
-  if (n) {
+  /* A pool written before `seen` existed parses as zero lines, which would
+     otherwise look exactly like a target with nothing left unsolved. */
 
-    qsort(sites, n, sizeof(struct unsolved_site), cmp_unsolved_site);
+  if (!afl->unsolved.cnt) {
 
-    u32 uniq = 1;
+    FATAL("No usable lines in '%s' -- regenerate it with afl-taint-scan", fname);
 
-    for (u32 i = 1; i < n; i++) {
+  }
 
-      if (cmp_unsolved_site(&sites[i], &sites[uniq - 1])) {
+  OKF("Loaded %u unsolved comparison site%s (from %u line%s) from '%s'.",
+      afl->unsolved.cnt, afl->unsolved.cnt == 1 ? "" : "s", lines,
+      lines == 1 ? "" : "s", fname);
 
-        sites[uniq++] = sites[i];
+  /* Every stored site must come back through the lookup it was built for. */
+
+  if (afl->debug) {
+
+    struct unsolved_set *s = &afl->unsolved;
+    u32                  hits = 0;
+
+    for (u32 i = 0; i < s->cap; i++) {
+
+      if (s->slots[i].used &&
+          unsolved_lookup(s, s->slots[i].cmpid, s->slots[i].context) ==
+              &s->slots[i]) {
+
+        ++hits;
 
       }
 
     }
 
-    n = uniq;
-    sites = ck_realloc(sites, n * sizeof(struct unsolved_site));
+    fprintf(stderr, "[D] unsolved lookup self-check: %u/%u hit, cap %u\n",
+            hits, s->cnt, s->cap);
 
   }
-
-  /* A pool written before `seen` existed parses as zero lines, which would
-     otherwise look exactly like a target with nothing left unsolved. */
-
-  if (!n) { FATAL("No usable lines in '%s' -- regenerate it with afl-taint-scan", fname); }
-
-  afl->unsolved = sites;
-  afl->unsolved_cnt = n;
-
-  OKF("Loaded %u unsolved comparison site%s (from %u line%s) from '%s'.", n,
-      n == 1 ? "" : "s", lines, lines == 1 ? "" : "s", fname);
 
   ck_free(fname);
 
@@ -462,10 +592,9 @@ void destroy_reusing_data(afl_state_t *afl) {
   afl->value_pool_cnt = 0;
   afl->value_pool_segs = 0;
 
-  if (afl->unsolved) { ck_free(afl->unsolved); }
+  if (afl->unsolved.slots) { ck_free(afl->unsolved.slots); }
 
-  afl->unsolved = NULL;
-  afl->unsolved_cnt = 0;
+  memset(&afl->unsolved, 0, sizeof(afl->unsolved));
 
 }
 

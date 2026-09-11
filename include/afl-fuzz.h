@@ -385,6 +385,19 @@ struct unsolved_site {
   u32 context;
   s32 seen;                             /* the one condition value seen, or
                                            -1 if there was no single one    */
+  u8  used;                             /* slot occupied                    */
+
+};
+
+/* Open-addressing hash set of unsolved sites, keyed on (cmpid, context).
+   Grows on insert and supports removal, since the fuzzer will keep adding
+   newly found sites and dropping ones it solves. */
+
+struct unsolved_set {
+
+  struct unsolved_site *slots;
+  u32                   cap;            /* power of two                     */
+  u32                   cnt;
 
 };
 
@@ -893,8 +906,7 @@ typedef struct afl_state {
   struct value_pool_entry *value_pool;      /* value_pool.dict, one per line*/
   u32                      value_pool_cnt;  /* Entries loaded               */
   u32                      value_pool_segs; /* Segments across all entries  */
-  struct unsolved_site    *unsolved;        /* sorted, for bsearch()        */
-  u32                      unsolved_cnt;
+  struct unsolved_set      unsolved;        /* unsolved_condition           */
   u32                      taint_success;   /* seeds with a pool .dtaint    */
   u32                      taint_missing;   /* seeds without one            */
 
@@ -1454,6 +1466,10 @@ void destroy_extras(afl_state_t *);
 void load_reusing_data(afl_state_t *);
 void destroy_reusing_data(afl_state_t *);
 void reusing_copy_seed_taint(afl_state_t *, u8 *, u8 *);
+
+struct unsolved_site *unsolved_lookup(struct unsolved_set *, u32, u32);
+struct unsolved_site *unsolved_insert(struct unsolved_set *, u32, u32, s32);
+u8                    unsolved_remove(struct unsolved_set *, u32, u32);
 u8   reusing_stage(afl_state_t *, u8 *, u8 *, u32);
 
 /* Stats */
