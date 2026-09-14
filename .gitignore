@@ -150,3 +150,8 @@ test/test-multiple-mutators
 
 # build.sh's hash-based rebuild-skip cache (Reusing-unibench_build/tools/build.sh)
 /_build_cache/
+
+# taint pre-pass build outputs (src/afl-taint-scan.c, dtaint_runtime/)
+/afl-taint-scan
+/libdtaint-rt.a
+/dtaint_runtime/libdtaint-rt.a
