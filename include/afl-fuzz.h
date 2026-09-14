@@ -400,23 +400,24 @@ struct value_bucket {
 };
 
 /* One line of unsolved_condition (-r): a comparison site that has only ever
-   gone one way. Keyed on the pair, since a site can be solved under one call
-   context and still open under another. */
+   gone one way. Keyed on the triple, since a site can be solved under one
+   call context and still open under another, and a second reach of it in the
+   same run is tracked separately -- that is how the scanner's queue counts
+   them. */
 
 struct unsolved_site {
 
   u32 cmpid;
   u32 context;
   u32 order;
-  s32 seen;                             /* the one condition value seen, or
-                                           -1 if there was no single one    */
+  s32 seen;                             /* the one condition value seen    */
   u8  used;                             /* slot occupied                    */
 
 };
 
-/* Open-addressing hash set of unsolved sites, keyed on (cmpid, context).
-   Grows on insert and supports removal, since the fuzzer will keep adding
-   newly found sites and dropping ones it solves. */
+/* Open-addressing hash set of unsolved sites, keyed on (cmpid, context,
+   order). Grows on insert and supports removal, since the fuzzer will keep
+   adding newly found sites and dropping ones it solves. */
 
 struct unsolved_set {
 

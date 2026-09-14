@@ -7,8 +7,8 @@
 
      value_pool.dict     - value candidates, one entry per line, each entry
                            one or more segments (see struct value_pool_entry)
-     unsolved_condition  - (cmpid, context) sites never seen going more than
-                           one way
+     unsolved_condition  - (cmpid, context, order) sites never seen going
+                           more than one way
 
    Both are currently mandatory once -r is given: a missing or unreadable
    file is FATAL. That is deliberately strict for now -- while the reuse
@@ -49,8 +49,8 @@
 #define REUSING_MAX_LINE \
   (REUSING_MAX_SEGS_PER_ENTRY * (REUSING_MAX_SEG_LEN * 4 + 3) + 16)
 
-/* unsolved_condition lines are two fixed-width fields ("cmpid=%u
-   context=%u"), so they need nothing like the above. */
+/* unsolved_condition lines are four fixed-width fields ("cmpid=%u
+   context=%u order=%u seen=%d"), so they need nothing like the above. */
 #define REUSING_MAX_UNSOLVED_LINE 256
 
 /* Decodes one "..." segment starting at *pp (which must point at the
@@ -417,8 +417,7 @@ struct value_bucket *value_pool_find(afl_state_t *afl, u32 *lens, u32 n_lens) {
 
 /* ---------------------------------------------------------------------- */
 /* unsolved_set: open addressing, linear probing, power-of-two capacity,   */
-/* kept under 3/4 full. Same hash afl-taint-scan's cond_status_hash() uses */
-/* for the same key.                                                        */
+/* kept under 3/4 full, keyed on (cmpid, context, order).                   */
 /* ---------------------------------------------------------------------- */
 
 static inline u32 unsolved_hash(u32 cmpid, u32 context, u32 order) {
@@ -427,8 +426,8 @@ static inline u32 unsolved_hash(u32 cmpid, u32 context, u32 order) {
 
 }
 
-/* Index of the slot holding (cmpid, context), or of the empty slot where it
-   would go. Terminates because the set is never full. */
+/* Index of the slot holding (cmpid, context, order), or of the empty slot
+   where it would go. Terminates because the set is never full. */
 
 static u32 unsolved_probe(struct unsolved_set *s, u32 cmpid, u32 context,
                           u32 order) {
