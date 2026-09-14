@@ -421,22 +421,24 @@ struct value_bucket *value_pool_find(afl_state_t *afl, u32 *lens, u32 n_lens) {
 /* for the same key.                                                        */
 /* ---------------------------------------------------------------------- */
 
-static inline u32 unsolved_hash(u32 cmpid, u32 context) {
+static inline u32 unsolved_hash(u32 cmpid, u32 context, u32 order) {
 
-  return cmpid * 2654435761u ^ context;
+  return (cmpid * 2654435761u ^ context) * 2654435761u ^ order;
 
 }
 
 /* Index of the slot holding (cmpid, context), or of the empty slot where it
    would go. Terminates because the set is never full. */
 
-static u32 unsolved_probe(struct unsolved_set *s, u32 cmpid, u32 context) {
+static u32 unsolved_probe(struct unsolved_set *s, u32 cmpid, u32 context,
+                          u32 order) {
 
   u32 mask = s->cap - 1;
-  u32 idx = unsolved_hash(cmpid, context) & mask;
+  u32 idx = unsolved_hash(cmpid, context, order) & mask;
 
   while (s->slots[idx].used &&
-         (s->slots[idx].cmpid != cmpid || s->slots[idx].context != context)) {
+         (s->slots[idx].cmpid != cmpid || s->slots[idx].context != context ||
+          s->slots[idx].order != order)) {
 
     idx = (idx + 1) & mask;
 
@@ -458,7 +460,8 @@ static void unsolved_grow(struct unsolved_set *s) {
 
     if (old[i].used) {
 
-      s->slots[unsolved_probe(s, old[i].cmpid, old[i].context)] = old[i];
+      s->slots[unsolved_probe(s, old[i].cmpid, old[i].context, old[i].order)] =
+          old[i];
 
     }
 
@@ -469,11 +472,12 @@ static void unsolved_grow(struct unsolved_set *s) {
 }
 
 struct unsolved_site *unsolved_lookup(struct unsolved_set *s, u32 cmpid,
-                                      u32 context) {
+                                      u32 context, u32 order) {
 
   if (!s->cnt) { return NULL; }
 
-  struct unsolved_site *slot = &s->slots[unsolved_probe(s, cmpid, context)];
+  struct unsolved_site *slot =
+      &s->slots[unsolved_probe(s, cmpid, context, order)];
 
   return slot->used ? slot : NULL;
 
@@ -483,16 +487,18 @@ struct unsolved_site *unsolved_lookup(struct unsolved_set *s, u32 cmpid,
    Check s->cnt around the call to tell the two apart. */
 
 struct unsolved_site *unsolved_insert(struct unsolved_set *s, u32 cmpid,
-                                      u32 context, s32 seen) {
+                                      u32 context, u32 order, s32 seen) {
 
   if ((u64)(s->cnt + 1) * 4 > (u64)s->cap * 3) { unsolved_grow(s); }
 
-  struct unsolved_site *slot = &s->slots[unsolved_probe(s, cmpid, context)];
+  struct unsolved_site *slot =
+      &s->slots[unsolved_probe(s, cmpid, context, order)];
 
   if (!slot->used) {
 
     slot->cmpid = cmpid;
     slot->context = context;
+    slot->order = order;
     slot->seen = seen;
     slot->used = 1;
     ++s->cnt;
@@ -508,12 +514,12 @@ struct unsolved_site *unsolved_insert(struct unsolved_set *s, u32 cmpid,
    the hole, so no lookup ever hits a false empty slot. No tombstones, so
    heavy churn never degrades the table. Returns 1 if the site was there. */
 
-u8 unsolved_remove(struct unsolved_set *s, u32 cmpid, u32 context) {
+u8 unsolved_remove(struct unsolved_set *s, u32 cmpid, u32 context, u32 order) {
 
   if (!s->cnt) { return 0; }
 
   u32 mask = s->cap - 1;
-  u32 hole = unsolved_probe(s, cmpid, context);
+  u32 hole = unsolved_probe(s, cmpid, context, order);
 
   if (!s->slots[hole].used) { return 0; }
 
@@ -528,7 +534,8 @@ u8 unsolved_remove(struct unsolved_set *s, u32 cmpid, u32 context) {
 
     if (!s->slots[j].used) { break; }
 
-    u32 home = unsolved_hash(s->slots[j].cmpid, s->slots[j].context) & mask;
+    u32 home = unsolved_hash(s->slots[j].cmpid, s->slots[j].context,
+                             s->slots[j].order) & mask;
 
     /* Movable iff home is not strictly inside (hole, j] cyclically. */
     if (((j - home) & mask) >= ((j - hole) & mask)) {
@@ -546,7 +553,7 @@ u8 unsolved_remove(struct unsolved_set *s, u32 cmpid, u32 context) {
 }
 
 /* unsolved_condition -> afl->unsolved. Lines look like
-   "cmpid=<n> context=<n> seen=<n>". */
+   "cmpid=<n> context=<n> order=<n> seen=<n>". */
 
 static void load_unsolved_sites(afl_state_t *afl) {
 
@@ -564,7 +571,7 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
   while (fgets((char *)line, REUSING_MAX_UNSOLVED_LINE, f)) {
 
-    u32 cmpid, context;
+    u32 cmpid, context, order;
     s32 seen;
 
     /* Same fgets() split as above. Harmless here -- a tail fragment simply
@@ -584,8 +591,8 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
     if (line[0] == '#') { continue; }
 
-    if (sscanf((char *)line, "cmpid=%u context=%u seen=%d", &cmpid, &context,
-               &seen) != 3) {
+    if (sscanf((char *)line, "cmpid=%u context=%u order=%u seen=%d", &cmpid,
+               &context, &order, &seen) != 4) {
 
       continue;
 
@@ -595,7 +602,7 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
     u32                   before = afl->unsolved.cnt;
     struct unsolved_site *slot =
-        unsolved_insert(&afl->unsolved, cmpid, context, seen);
+        unsolved_insert(&afl->unsolved, cmpid, context, order, seen);
 
     if (afl->unsolved.cnt == before) {
 
@@ -603,8 +610,10 @@ static void load_unsolved_sites(afl_state_t *afl) {
          the writer is inconsistent, which is worth hearing about. */
       if (slot->seen != seen && dup < 5) {
 
-        WARNF("Site cmpid=%u context=%u listed twice with seen=%d and seen=%d",
-              cmpid, context, slot->seen, seen);
+        WARNF(
+            "Site cmpid=%u context=%u order=%u listed twice with seen=%d and "
+            "seen=%d",
+            cmpid, context, order, slot->seen, seen);
 
       }
 
@@ -649,7 +658,8 @@ static void load_unsolved_sites(afl_state_t *afl) {
     for (u32 i = 0; i < s->cap; i++) {
 
       if (s->slots[i].used &&
-          unsolved_lookup(s, s->slots[i].cmpid, s->slots[i].context) ==
+          unsolved_lookup(s, s->slots[i].cmpid, s->slots[i].context,
+                          s->slots[i].order) ==
               &s->slots[i]) {
 
         ++hits;
@@ -910,6 +920,12 @@ static int cmp_cand_key(const void *a, const void *b) {
 
   }
 
+  if (x->site.order != y->site.order) {
+
+    return x->site.order < y->site.order ? -1 : 1;
+
+  }
+
   return 0;
 
 }
@@ -1038,6 +1054,7 @@ struct taint_map *taint_map_load(afl_state_t *afl, u8 *queue_name) {
     cand[n_cand].n_offsets = n;
     cand[n_cand].site.cmpid = c.cmpid;
     cand[n_cand].site.context = c.context;
+    cand[n_cand].site.order = c.order;
     ++n_cand;
 
     for (u32 j = 0; j < n; j++) {
@@ -1100,7 +1117,8 @@ struct taint_map *taint_map_load(afl_state_t *afl, u8 *queue_name) {
       struct taint_site *s = &cand[idx[i]].site;
 
       if (!dst->n_sites || s->cmpid != dst->sites[dst->n_sites - 1].cmpid ||
-          s->context != dst->sites[dst->n_sites - 1].context) {
+          s->context != dst->sites[dst->n_sites - 1].context ||
+          s->order != dst->sites[dst->n_sites - 1].order) {
 
         dst->sites[dst->n_sites++] = *s;
 
@@ -1140,7 +1158,7 @@ void taint_map_filter_unsolved(afl_state_t *afl, struct taint_map *m) {
     for (u32 j = 0; j < src->n_sites; j++) {
 
       if (unsolved_lookup(&afl->unsolved, src->sites[j].cmpid,
-                          src->sites[j].context)) {
+                          src->sites[j].context, src->sites[j].order)) {
 
         src->sites[kept++] = src->sites[j];
 

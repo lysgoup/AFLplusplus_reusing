@@ -407,6 +407,7 @@ struct unsolved_site {
 
   u32 cmpid;
   u32 context;
+  u32 order;
   s32 seen;                             /* the one condition value seen, or
                                            -1 if there was no single one    */
   u8  used;                             /* slot occupied                    */
@@ -434,12 +435,15 @@ struct offset {
 
 };
 
-/* A comparison, keyed the way unsolved sites are. */
+/* A comparison, keyed the way unsolved sites are: the same site reached a
+   second time in one run is a separate entry, which is how Angora's own
+   queue counts them. */
 
 struct taint_site {
 
   u32 cmpid;
   u32 context;
+  u32 order;
 
 };
 
@@ -1541,9 +1545,9 @@ struct taint_map *taint_map_load(afl_state_t *, u8 *);
 void              taint_map_filter_unsolved(afl_state_t *, struct taint_map *);
 void              taint_map_free(struct taint_map *);
 
-struct unsolved_site *unsolved_lookup(struct unsolved_set *, u32, u32);
-struct unsolved_site *unsolved_insert(struct unsolved_set *, u32, u32, s32);
-u8                    unsolved_remove(struct unsolved_set *, u32, u32);
+struct unsolved_site *unsolved_lookup(struct unsolved_set *, u32, u32, u32);
+struct unsolved_site *unsolved_insert(struct unsolved_set *, u32, u32, u32, s32);
+u8                    unsolved_remove(struct unsolved_set *, u32, u32, u32);
 u8   reusing_stage(afl_state_t *, u8 *, u8 *, u32);
 
 /* Stats */
