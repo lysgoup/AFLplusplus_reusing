@@ -1051,19 +1051,35 @@ struct taint_map *taint_map_load(afl_state_t *afl, u8 *queue_name) {
     }
 
     cand[n_cand].offset_idx = n_coff;
-    cand[n_cand].n_offsets = n;
     cand[n_cand].site.cmpid = c.cmpid;
     cand[n_cand].site.context = c.context;
     cand[n_cand].site.order = c.order;
-    ++n_cand;
+
+    /* Glue touching ranges into one, the way Angora's
+       merge_continuous_segments() does. Its pool is keyed on the merged
+       lengths and its reusing mutation writes the merged span, so a run of
+       single bytes has to arrive here as one range or nothing in the pool
+       would ever match it. */
+
+    u32 first = n_coff;
 
     for (u32 j = 0; j < n; j++) {
+
+      if (n_coff > first && coff[n_coff - 1].end == segs[j].begin) {
+
+        coff[n_coff - 1].end = segs[j].end;
+        continue;
+
+      }
 
       coff[n_coff].begin = segs[j].begin;
       coff[n_coff].end = segs[j].end;
       ++n_coff;
 
     }
+
+    cand[n_cand].n_offsets = n_coff - first;
+    ++n_cand;
 
   }
 
