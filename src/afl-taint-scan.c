@@ -10,7 +10,7 @@
                                include/dtaint.h)
      value_pool.dict         - value candidates accumulated across the
                                whole scan
-     unsolved_condition      - (cmpid, context) sites never seen going
+     unsolved_condition      - (cmpid, context, order) sites never seen going
                                more than one way
 
    afl-fuzz reads that directory back via -r. It used to have a second,
@@ -176,7 +176,7 @@ static void usage(u8 *argv0) {
       "                         segment-length pattern, annotated with "
       "\"# label\n"
       "                         pattern: [...]\" comments.\n"
-      "  unsolved_condition   - every (cmpid, context) site whose condition "
+      "  unsolved_condition   - every (cmpid, context, order) site whose condition "
       "has\n"
       "                         never gone more than one way across the "
       "whole\n"
@@ -738,14 +738,13 @@ static u8 novelty_check_and_mark(novelty_set_t *s, u32 cmpid, u32 context, u32 c
 }
 
 /* ---------------------------------------------------------------------- */
-/* Unsolved-condition tracking -- for every (cmpid, context) site that has */
-/* taint, remembers which distinct `condition` outcomes have been seen     */
-/* across every input this process has analyzed in one scan.               */
-/* batch alike), so a downstream reader knows which sites have never gone  */
-/* more than one way. A site counts as "solved" once 2+ distinct outcomes  */
-/* have been observed -- except a switch (DTAINT_COND_SW_OP), which has no */
-/* fixed "the other side": it's always reported, no matter how many cases  */
-/* have fired.                                                             */
+/* Unsolved-condition tracking -- for every (cmpid, context, order) site   */
+/* reached under taint, remembers which distinct `condition` outcomes have */
+/* been seen across every input this process analyzed in one scan, so a    */
+/* downstream reader knows which sites never went more than one way. A     */
+/* site counts as "solved" once 2+ distinct outcomes have been observed -- */
+/* except a switch (DTAINT_COND_SW_OP), which has no fixed "the other      */
+/* side": it's always reported, no matter how many cases have fired.       */
 /* ---------------------------------------------------------------------- */
 
 #define COND_STATUS_INITIAL_CAP 4096
@@ -754,6 +753,7 @@ typedef struct {
 
   u32           cmpid;
   u32           context;
+  u32           order;
   u32           op;
   u32           n_distinct;
   u32           seen_conditions[2];
@@ -777,17 +777,19 @@ static void cond_status_init(cond_status_set_t *s) {
 
 }
 
-static u32 cond_status_hash(u32 cmpid, u32 context) {
+static u32 cond_status_hash(u32 cmpid, u32 context, u32 order) {
 
   u32 h = cmpid;
   h = h * 2654435761u ^ context;
+  h = h * 2654435761u ^ order;
   return h;
 
 }
 
-static cond_status_slot_t *cond_status_raw_insert(cond_status_set_t *s, u32 cmpid, u32 context) {
+static cond_status_slot_t *cond_status_raw_insert(cond_status_set_t *s, u32 cmpid,
+                                                  u32 context, u32 order) {
 
-  u32 idx = cond_status_hash(cmpid, context) % s->cap;
+  u32 idx = cond_status_hash(cmpid, context, order) % s->cap;
 
   while (s->slots[idx].used) idx = (idx + 1) % s->cap;
 
@@ -795,6 +797,7 @@ static cond_status_slot_t *cond_status_raw_insert(cond_status_set_t *s, u32 cmpi
   s->slots[idx].used = 1;
   s->slots[idx].cmpid = cmpid;
   s->slots[idx].context = context;
+  s->slots[idx].order = order;
   s->count++;
 
   return &s->slots[idx];
@@ -814,7 +817,8 @@ static void cond_status_grow(cond_status_set_t *s) {
 
     if (old_slots[i].used) {
 
-      cond_status_slot_t *ns = cond_status_raw_insert(s, old_slots[i].cmpid, old_slots[i].context);
+      cond_status_slot_t *ns = cond_status_raw_insert(
+          s, old_slots[i].cmpid, old_slots[i].context, old_slots[i].order);
       *ns = old_slots[i];
 
     }
@@ -825,34 +829,37 @@ static void cond_status_grow(cond_status_set_t *s) {
 
 }
 
-static cond_status_slot_t *cond_status_find_or_create(cond_status_set_t *s, u32 cmpid, u32 context) {
+static cond_status_slot_t *cond_status_find_or_create(cond_status_set_t *s, u32 cmpid,
+                                                      u32 context, u32 order) {
 
   if ((u64)(s->count + 1) * 4 >= (u64)s->cap * 3) cond_status_grow(s);
 
-  u32 idx = cond_status_hash(cmpid, context) % s->cap;
+  u32 idx = cond_status_hash(cmpid, context, order) % s->cap;
 
   while (s->slots[idx].used) {
 
-    if (s->slots[idx].cmpid == cmpid && s->slots[idx].context == context) return &s->slots[idx];
+    if (s->slots[idx].cmpid == cmpid && s->slots[idx].context == context &&
+        s->slots[idx].order == order)
+      return &s->slots[idx];
     idx = (idx + 1) % s->cap;
 
   }
 
-  return cond_status_raw_insert(s, cmpid, context);
+  return cond_status_raw_insert(s, cmpid, context, order);
 
 }
 
-/* Records one more sighting of (cmpid, context): updates op, adds
+/* Records one more sighting of (cmpid, context, order): updates op, adds
    `condition` to the distinct-outcomes set if it's not already there (only
    the first two distinct values are kept -- that's all "solved" needs),
    and overwrites the stored offsets with this sighting's (so the report
    reflects the most recent occurrence, not necessarily the first). */
-static void cond_status_update(cond_status_set_t *s, u32 cmpid, u32 context, u32 op,
-                               u32 condition) {
+static void cond_status_update(cond_status_set_t *s, u32 cmpid, u32 context,
+                               u32 order, u32 op, u32 condition) {
 
   if (!s) return;
 
-  cond_status_slot_t *slot = cond_status_find_or_create(s, cmpid, context);
+  cond_status_slot_t *slot = cond_status_find_or_create(s, cmpid, context, order);
   slot->op = op;
 
   u8 known = 0;
@@ -892,7 +899,7 @@ static void unsolved_write(cond_status_set_t *s, const char *path) {
   }
 
   fprintf(f, "# unsolved conditions -- %u of %u tracked site(s) never seen both ways "
-             "(cmpid, context)\n", n_unsolved, s->count);
+             "(cmpid, context, order)\n", n_unsolved, s->count);
   fprintf(f, "# seen = the one condition value ever produced here (%u false, "
              "%u true, %u done), or -1 if there was no single one\n",
           DTAINT_COND_FALSE_ST, DTAINT_COND_TRUE_ST, DTAINT_COND_DONE_ST);
@@ -911,8 +918,8 @@ static void unsolved_write(cond_status_set_t *s, const char *path) {
        need not have a single direction. */
     s32 seen = slot->n_distinct == 1 ? (s32)slot->seen_conditions[0] : -1;
 
-    fprintf(f, "cmpid=%u context=%u seen=%d\n", slot->cmpid, slot->context,
-            seen);
+    fprintf(f, "cmpid=%u context=%u order=%u seen=%d\n", slot->cmpid,
+            slot->context, slot->order, seen);
 
   }
 
@@ -1194,7 +1201,7 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
      for every tainted comparison, regardless of op or outcome, that
      produced a (cmpid, context, condition) combination never seen before
      in this process's lifetime: (1) feed value_pool.dict, and (2) update
-     unsolved_condition's per-(cmpid, context) outcome history (see
+     unsolved_condition's per-(cmpid, context, order) outcome history (see
      cond_status_update()) -- both gated on the same novelty check, so a
      site that's already fully explored doesn't cost anything on repeat
      sightings.
@@ -1218,8 +1225,8 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
 
     if (group_end[i] > group_begin[i]) {
 
-      cond_status_update(cond_status, conds[i].cmpid, conds[i].context, conds[i].op,
-                         conds[i].condition);
+      cond_status_update(cond_status, conds[i].cmpid, conds[i].context,
+                         conds[i].order, conds[i].op, conds[i].condition);
 
       if (group_end[i] <= orig_input_len) {
 
@@ -1235,8 +1242,8 @@ static int transcode_dtaint_with_magic_groups(const char *scratch_path,
         pick_primary_side(tags, hdr.n_tags, conds[i].lb1, conds[i].lb2);
     if (!primary || !primary->n_segs) continue;
 
-    cond_status_update(cond_status, conds[i].cmpid, conds[i].context, conds[i].op,
-                       conds[i].condition);
+    cond_status_update(cond_status, conds[i].cmpid, conds[i].context,
+                       conds[i].order, conds[i].op, conds[i].condition);
 
     dict_add_side(dict, primary, orig_input, orig_input_len);
 
