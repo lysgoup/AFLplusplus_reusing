@@ -604,6 +604,42 @@ u8 fuzz_one(afl_state_t *afl) {
 
   }
 
+  /* -r: reusing saturates early (measured on objdump: 88% of its 24 h
+     coverage gain landed in the first 8 h), so the rest of the campaign is
+     better spent on the new ground it turned up. Give every entry we found
+     ourselves that time.
+
+     Deliberately keyed on from_seed, NOT on has_taint: a SEED without a
+     .dtaint also gets no reusing stage, but it is not new ground -- it is
+     corpus a previous campaign already fuzzed for 24 h, and there are far
+     more of those than of real finds (objdump: 3782 such seeds against 131
+     finds in 24 h), so paying them this would spend the budget on the wrong
+     inputs. Seeds go the other way and give some of theirs up. Left
+     untouched without -r. */
+
+  if (unlikely(afl->reusing_mode)) {
+
+    if (!afl->queue_cur->from_seed) {
+
+      u64 boosted = (u64)perf_score * REUSING_NEW_ENERGY_MULT;
+      u64 ceiling = (u64)afl->havoc_max_mult * 100 * REUSING_NEW_ENERGY_MULT;
+
+      perf_score = (u32)(boosted > ceiling ? ceiling : boosted);
+
+    } else {
+
+      /* The other side of the same trade: a seed's havoc and splice are what
+         the reusing stage and the new finds are taking their time from. */
+
+      perf_score /= REUSING_SEED_ENERGY_DIV;
+      if (!perf_score) { perf_score = 1; }
+
+    }
+
+    orig_perf = perf_score;
+
+  }
+
   if (unlikely(afl->shm.cmplog_mode &&
                afl->queue_cur->colorized < afl->cmplog_lvl &&
                (u32)len <= afl->cmplog_max_filesize)) {
@@ -661,7 +697,8 @@ u8 fuzz_one(afl_state_t *afl) {
      want its time to go to. Skip both the skipdet inference pass and the
      deterministic stages for every seed -- including one with no .dtaint,
      which gets no reusing stage either but is still not new ground. Entries
-     this campaign found keep the ordinary pipeline. */
+     this campaign found keep the ordinary pipeline (and, per the energy
+     boost above, more of it). */
 
   u8 reusing_skip_det =
       unlikely(afl->reusing_mode) && afl->queue_cur->from_seed;
