@@ -40,6 +40,7 @@
 #endif
 
 #include "config.h"
+#include "reusing_config.h"
 #ifdef HAVE_ZLIB
   #include <zlib.h>
 #endif

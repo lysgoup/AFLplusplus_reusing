@@ -224,11 +224,13 @@
 
 #define HAVOC_MIN 12U
 
-/* Executions one reusing stage (-r) may spend on a queue entry. Whatever it
-   does not get through is picked up on the next visit, so this only decides
-   how finely the work is sliced. Same order as a havoc round. */
-
-#define REUSING_MAX_EXEC 256U
+/* The -r reusing stage's own tunables are in reusing_config.h, deliberately
+   not included from here: tools/build.sh treats a change to config.h as a
+   change to the instrumentation toolchain and rebuilds the base image and
+   every unibench target, while include/reusing_* counts as fuzzer-only and
+   rebuilds afl-fuzz alone. Pulling it in here would put it in front of the
+   compiler passes and the runtime, which is exactly what that split is
+   avoiding. afl-fuzz.h includes it instead. */
 
 /* Power Schedule Divisor */
 #define POWER_BETA 1U
