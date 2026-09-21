@@ -1266,12 +1266,15 @@ static void reusing_restore(u8 *buf, u8 *orig_buf, struct offsets *g) {
 
 }
 
-/* Reusing stage: for each of this input's offsets, overwrite its ranges with
-   every value pool entry of the same taint pattern and run the target. Stops
-   after REUSING_MAX_EXEC executions; queue_cur->reusing_cur remembers how far
-   each offsets got, so the next visit picks up at the first value it has not
-   tried -- including any appended to the pool since. Returns 1 if the caller
-   should give up on this queue entry, 0 otherwise. */
+/* Reusing stage: overwrite this input's tainted ranges with pool values of
+   the matching taint pattern and run the target. Works through the range
+   sets a few values at a time rather than draining one before starting the
+   next, so a visit reaches many sites instead of exhausting one; the budget
+   is REUSING_TRIES_PER_OFFSETS per range set that still has values left,
+   between REUSING_MIN_EXEC and REUSING_MAX_EXEC. queue_cur->reusing_cur
+   remembers how far each range set got, so the next visit picks up at the
+   first value it has not tried -- including any appended to the pool since.
+   Returns 1 if the caller should give up on this queue entry, 0 otherwise. */
 
 u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
@@ -1322,27 +1325,58 @@ u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
   u32 remaining = 0;
 
+  /* Looked up once and kept: the round-robin below revisits every offsets
+     many times over one stage, and this is a binary search over the whole
+     pool each call. */
+
+  struct value_bucket **buckets =
+      m->n_offsets ? ck_alloc(m->n_offsets * sizeof(struct value_bucket *))
+                   : NULL;
+
+  u32 live = 0;
+
   for (u32 i = 0; i < m->n_offsets; i++) {
 
     struct offsets      *g = &m->offsets[i];
     struct value_bucket *b = reusing_bucket(afl, g, len);
 
-    if (b && cur[g->idx] < b->n_entries) { remaining += b->n_entries - cur[g->idx]; }
+    buckets[i] = b;
+
+    if (b && cur[g->idx] < b->n_entries) {
+
+      remaining += b->n_entries - cur[g->idx];
+      ++live;
+
+    }
 
   }
 
-  afl->stage_max = MIN(remaining, (u32)REUSING_MAX_EXEC);
+  /* Budgeted per range set that still has something to try, so the figure
+     means the same thing on a two-range input and a thousand-range one.
+     Counting all of m->n_offsets instead would inflate it with the sets the
+     pool can never serve -- a lone tainted byte, over half of them on some
+     targets -- and quietly hand their share to the rest. */
+
+  u32 budget = live * (u32)REUSING_TRIES_PER_OFFSETS;
+
+  if (budget < REUSING_MIN_EXEC) { budget = REUSING_MIN_EXEC; }
+  if (budget > REUSING_MAX_EXEC) { budget = REUSING_MAX_EXEC; }
+
+  afl->stage_max = MIN(remaining, budget);
 
   if (afl->debug) {
 
-    fprintf(stderr, "[D] reusing_stage: '%s' len=%u offsets=%u execs=%u/%u\n",
-            afl->queue_cur->fname, len, m->n_offsets, afl->stage_max, remaining);
+    fprintf(stderr,
+            "[D] reusing_stage: '%s' len=%u offsets=%u live=%u execs=%u/%u\n",
+            afl->queue_cur->fname, len, m->n_offsets, live, afl->stage_max,
+            remaining);
 
   }
 
   if (!afl->stage_max) {
 
     afl->queue_cur->reusing_done = 1;
+    if (buckets) { ck_free(buckets); }
     taint_map_free(m);
     return 0;
 
@@ -1355,27 +1389,50 @@ u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
   u64 orig_hit_cnt = afl->queued_items + afl->saved_crashes;
   u8  ret = 0;
 
-  for (u32 i = 0; i < m->n_offsets && afl->stage_cur < afl->stage_max; i++) {
+  /* A few values per range set, then on to the next one, around and around
+     until the budget is gone. Draining a set before moving on instead would
+     spend a whole visit inside the first one -- an nm seed carries a
+     thousand sets over half a million pool values, so every site past the
+     first few would go untouched for the whole campaign.
 
-    struct offsets      *g = &m->offsets[i];
-    struct value_bucket *b = reusing_bucket(afl, g, len);
+     The second and later laps only matter when some sets ran dry early:
+     with every set still holding values the first lap spends the budget
+     exactly, one pass over the array. Cursors are per range set and live on
+     the queue entry, so the next visit picks each one up where this left
+     it. */
 
-    if (!b) { continue; }
+  for (u8 progress = 1; progress && afl->stage_cur < afl->stage_max;) {
 
-    while (cur[g->idx] < b->n_entries && afl->stage_cur < afl->stage_max) {
+    progress = 0;
 
-      reusing_apply(buf, g, &b->entries[cur[g->idx]++]);
+    for (u32 i = 0; i < m->n_offsets && afl->stage_cur < afl->stage_max; i++) {
 
-      if (common_fuzz_stuff(afl, buf, len)) {
+      struct offsets      *g = &m->offsets[i];
+      struct value_bucket *b = buckets[i];
+
+      if (!b) { continue; }
+
+      for (u32 k = 0; k < REUSING_TRIES_PER_OFFSETS &&
+                      cur[g->idx] < b->n_entries &&
+                      afl->stage_cur < afl->stage_max;
+           k++) {
+
+        progress = 1;
+
+        reusing_apply(buf, g, &b->entries[cur[g->idx]++]);
+
+        if (common_fuzz_stuff(afl, buf, len)) {
+
+          reusing_restore(buf, orig_buf, g);
+          ret = 1;
+          goto done;
+
+        }
 
         reusing_restore(buf, orig_buf, g);
-        ret = 1;
-        goto done;
+        ++afl->stage_cur;
 
       }
-
-      reusing_restore(buf, orig_buf, g);
-      ++afl->stage_cur;
 
     }
 
@@ -1392,6 +1449,7 @@ done:
   afl->stage_cycles[STAGE_REUSING] += afl->stage_cur;
   afl->queue_cur->stats_mutated += afl->stage_cur;
 
+  if (buckets) { ck_free(buckets); }
   taint_map_free(m);
 
   return ret;
