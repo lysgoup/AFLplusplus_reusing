@@ -1440,9 +1440,14 @@ u8 reusing_stage(afl_state_t *afl, u8 *orig_buf, u8 *buf, u32 len) {
 
 done:
 
-  /* The budget covered all of it, so the cursors are now at the end. */
+  /* The budget covered all of it, so the cursors are now at the end. Saying
+     so here saves the next visit from re-reading and re-parsing the .dtaint
+     only to find nothing left. Compared against the budget this visit
+     actually got, not against the constant it is derived from -- those two
+     part company the moment the budget stops being a flat cap, and guessing
+     low here would retire an entry that still has values to try. */
 
-  if (!ret && remaining <= REUSING_MAX_EXEC) { afl->queue_cur->reusing_done = 1; }
+  if (!ret && remaining <= afl->stage_max) { afl->queue_cur->reusing_done = 1; }
 
   afl->stage_finds[STAGE_REUSING] +=
       afl->queued_items + afl->saved_crashes - orig_hit_cnt;
