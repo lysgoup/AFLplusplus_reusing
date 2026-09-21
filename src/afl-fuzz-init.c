@@ -1682,6 +1682,11 @@ void pivot_inputs(afl_state_t *afl) {
 
     link_or_copy(q->fname, nfn, afl->perm);
 
+    /* Everything pivoting here came from -i; anything queued after this loop
+       is something the campaign found for itself. */
+
+    q->from_seed = 1;
+
     /* Do the same for this seed's taint data, while the seed's own name
        (rsl) and the queue name are both still available -- q->fname is
        about to become the queue path. */
@@ -1689,7 +1694,7 @@ void pivot_inputs(afl_state_t *afl) {
     if (unlikely(afl->reusing_mode)) {
 
       u8 *qrsl = strrchr(nfn, '/');
-      reusing_copy_seed_taint(afl, rsl, qrsl ? qrsl + 1 : nfn);
+      q->has_taint = reusing_copy_seed_taint(afl, rsl, qrsl ? qrsl + 1 : nfn);
 
     }
 

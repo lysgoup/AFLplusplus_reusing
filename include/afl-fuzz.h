@@ -339,6 +339,22 @@ struct queue_entry {
                                            entry once the value pool can
                                            gain values or a site can go back
                                            to unsolved                      */
+  u8   has_taint;                       /* -r: a .dtaint of its own arrived
+                                           for this entry in the dry run.
+                                           0 for everything we find later,
+                                           and for a seed the scan had
+                                           nothing to say about -- either
+                                           way the reusing stage cannot help
+                                           it, so it is fuzzed on the
+                                           ordinary mutators' energy budget
+                                           instead (see fuzz_one)           */
+  u8   from_seed;                       /* Came in with -i and survived the
+                                           dry run, as opposed to being
+                                           found by this campaign. Only -r
+                                           reads it, to tell which entries
+                                           are new ground worth extra energy
+                                           and which are corpus that a
+                                           previous campaign already fuzzed  */
 
 };
 
@@ -1539,7 +1555,7 @@ void destroy_extras(afl_state_t *);
 
 void load_reusing_data(afl_state_t *);
 void destroy_reusing_data(afl_state_t *);
-void reusing_copy_seed_taint(afl_state_t *, u8 *, u8 *);
+u8   reusing_copy_seed_taint(afl_state_t *, u8 *, u8 *);
 
 struct value_bucket *value_pool_find(afl_state_t *, u32 *, u32);
 

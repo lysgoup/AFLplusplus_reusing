@@ -655,7 +655,18 @@ u8 fuzz_one(afl_state_t *afl) {
   u8 is_logged = 0;
 
 #endif
-  if (!afl->skip_deterministic) {
+
+  /* -r: a seed is corpus a previous campaign already fuzzed for 24 h,
+     deterministic stages included, and here the reusing stage is what we
+     want its time to go to. Skip both the skipdet inference pass and the
+     deterministic stages for every seed -- including one with no .dtaint,
+     which gets no reusing stage either but is still not new ground. Entries
+     this campaign found keep the ordinary pipeline. */
+
+  u8 reusing_skip_det =
+      unlikely(afl->reusing_mode) && afl->queue_cur->from_seed;
+
+  if (!afl->skip_deterministic && !reusing_skip_det) {
 
     if (!skip_deterministic_stage(afl, in_buf, out_buf, len, before_det_time)) {
 
@@ -674,7 +685,8 @@ u8 fuzz_one(afl_state_t *afl) {
   /* if skipdet decide to skip the seed or no interesting bytes found,
      we skip the whole deterministic stage as well */
 
-  if (likely(afl->skip_deterministic) || likely(afl->queue_cur->passed_det) ||
+  if (likely(afl->skip_deterministic) || reusing_skip_det ||
+      likely(afl->queue_cur->passed_det) ||
       likely(!afl->queue_cur->skipdet_e->quick_eff_bytes) ||
       likely(perf_score <
              (afl->queue_cur->depth * 30 <= afl->havoc_max_mult * 100

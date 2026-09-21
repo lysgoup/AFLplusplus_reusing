@@ -739,7 +739,7 @@ void destroy_reusing_data(afl_state_t *afl) {
    track file for an input the target had nothing taint-worthy to say about.
    Counted so the dry-run summary can show the real coverage. */
 
-void reusing_copy_seed_taint(afl_state_t *afl, u8 *seed_name, u8 *queue_name) {
+u8 reusing_copy_seed_taint(afl_state_t *afl, u8 *seed_name, u8 *queue_name) {
 
   u8 *src = alloc_printf("%s/%s.dtaint", afl->reusing_dir, seed_name);
 
@@ -747,7 +747,7 @@ void reusing_copy_seed_taint(afl_state_t *afl, u8 *seed_name, u8 *queue_name) {
 
     ++afl->taint_missing;
     ck_free(src);
-    return;
+    return 0;
 
   }
 
@@ -774,7 +774,7 @@ void reusing_copy_seed_taint(afl_state_t *afl, u8 *seed_name, u8 *queue_name) {
       ++afl->taint_missing;
       ck_free(src);
       ck_free(dst);
-      return;
+      return 0;
 
     }
 
@@ -797,7 +797,7 @@ void reusing_copy_seed_taint(afl_state_t *afl, u8 *seed_name, u8 *queue_name) {
       ++afl->taint_missing;
       ck_free(src);
       ck_free(dst);
-      return;
+      return 0;
 
     }
 
@@ -807,6 +807,8 @@ void reusing_copy_seed_taint(afl_state_t *afl, u8 *seed_name, u8 *queue_name) {
 
   ck_free(src);
   ck_free(dst);
+
+  return 1;
 
 }
 
