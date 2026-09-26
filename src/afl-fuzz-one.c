@@ -668,7 +668,7 @@ u8 fuzz_one(afl_state_t *afl) {
 
   }
 
-  /* Reusing: apply afl-taint-scan's precomputed value pool at this
+  /* Reusing: apply taint_scan's precomputed value pool at this
      input's own taint offsets. Sits right after cmplog for the same reason
      cmplog sits here -- both drive mutation from comparison information
      gathered outside the fuzzer -- and deliberately ahead of the

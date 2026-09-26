@@ -385,7 +385,7 @@ struct value_pool_seg {
 
 };
 
-/* One entry of the value pool: a single line of afl-taint-scan's
+/* One entry of the value pool: a single line of taint_scan's
    value_pool.dict (-r), i.e. one value candidate. n_segs == 1 is a plain
    magic-byte value; more than that is a run of segments that came out of
    the same taint label, so they all have to be in place at once for the
@@ -989,7 +989,7 @@ typedef struct afl_state {
   char            *cmplog_binary;
   afl_forkserver_t cmplog_fsrv;     /* cmplog has its own little forkserver */
 
-  /* Reusing (-r): afl-taint-scan's output, loaded once at startup. */
+  /* Reusing (-r): taint_scan's output, loaded once at startup. */
 
   u8                       reusing_mode;    /* -r given (and not '-r -')    */
   struct value_bucket     *value_pool;      /* value_pool.dict by pattern   */

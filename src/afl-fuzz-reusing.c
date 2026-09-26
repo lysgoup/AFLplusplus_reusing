@@ -2,7 +2,7 @@
    american fuzzy lop++ - reusing taint data
    -----------------------------------------
 
-   Loads what afl-taint-scan produced ahead of time for this target,
+   Loads what taint_scan produced ahead of time for this target,
    pointed at by -r:
 
      value_pool.dict     - value candidates, one entry per line, each entry
@@ -32,7 +32,7 @@
 
 #include <ctype.h>
 
-/* Must stay >= afl-taint-scan's own WORKER_DICT_MAX_ENTRY_LEN, which
+/* Must stay >= taint_scan's own max entry length, which
    is what actually bounds segment width on the writing side. A segment
    longer than this is treated as a malformed line rather than overrunning
    the decode buffer. */
@@ -639,7 +639,7 @@ static void load_unsolved_sites(afl_state_t *afl) {
 
   if (!afl->unsolved.cnt) {
 
-    FATAL("No usable lines in '%s' -- regenerate it with afl-taint-scan", fname);
+    FATAL("No usable lines in '%s' -- regenerate it with taint_scan", fname);
 
   }
 
@@ -726,7 +726,7 @@ void destroy_reusing_data(afl_state_t *afl) {
 
 /* Brings a dry-run seed's precomputed .dtaint across from the -r pool into
    <out_dir>/taint/, renaming it from the seed's own filename (which is how
-   afl-taint-scan keyed it) to the name the entry just got in the queue.
+   taint_scan keyed it) to the name the entry just got in the queue.
    Everything downstream then looks taint data up by queue entry name alone,
    with no need to know whether an entry came from a seed or was discovered
    later.
@@ -735,7 +735,7 @@ void destroy_reusing_data(afl_state_t *afl) {
    -- a moment later q->fname is overwritten with the queue path and the
    seed's own name is gone.
 
-   A seed with no .dtaint is normal, not an error: afl-taint-scan writes no
+   A seed with no .dtaint is normal, not an error: taint_scan writes no
    track file for an input the target had nothing taint-worthy to say about.
    Counted so the dry-run summary can show the real coverage. */
 
@@ -841,7 +841,7 @@ static struct tag_lookup *find_tag(struct tag_lookup *tags, u32 n, u32 label) {
 
 }
 
-/* Same rule as afl-taint-scan pick_primary_side(): fewer segments, lb1 on
+/* Same rule as taint_scan's pick_primary_side(): fewer segments, lb1 on
    tie. */
 
 static struct tag_lookup *pick_primary(struct tag_lookup *tags, u32 n, u32 lb1,
@@ -1218,7 +1218,7 @@ void taint_map_free(struct taint_map *m) {
 
 /* The bucket holding values shaped like this offsets' ranges, or NULL if
    there is nothing to try here. Wider than a pool entry can be means there
-   is nothing to find, since afl-taint-scan caps a value at that many
+   is nothing to find, since taint_scan caps a value at that many
    segments too; a range past the end of the input means the .dtaint no
    longer describes it, so leave those bytes alone. */
 

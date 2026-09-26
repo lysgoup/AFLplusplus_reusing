@@ -276,7 +276,7 @@ static void usage(u8 *argv0, int more_help) {
       "                  AFL_AUTORESUME)\n"
       "  -o dir        - output directory for fuzzer findings\n"
       "  -r dir        - directory of taint-analysis output for this target\n"
-      "                  (afl-taint-scan's value_pool.dict / "
+      "                  (taint_scan's value_pool.dict / "
       "unsolved_condition);\n"
       "                  '-r -' turns it back off\n\n"
 
