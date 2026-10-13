@@ -25,3 +25,11 @@
 [submodule "qemu_bridge/qemu-libafl-bridge"]
 	path = qemu_bridge/qemu-libafl-bridge
 	url = https://github.com/AFLplusplus/qemu-libafl-bridge
+[submodule "Reusing_scanner"]
+	path = Reusing_scanner
+	url = https://github.com/lysgoup/Reusing_scanner.git
+	branch = main
+[submodule "Reusing-unibench_build"]
+	path = Reusing-unibench_build
+	url = https://github.com/lysgoup/Reusing-unibench_build.git
+	branch = master
