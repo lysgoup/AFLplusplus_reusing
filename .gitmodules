@@ -27,7 +27,7 @@
 	url = https://github.com/AFLplusplus/qemu-libafl-bridge
 [submodule "Reusing_scanner"]
 	path = Reusing_scanner
-	url = git@github.com:lysgoup/Reusing_scanner.git
+	url = https://github.com/lysgoup/Reusing_scanner.git
 	branch = main
 [submodule "Reusing-unibench_build"]
 	path = Reusing-unibench_build
