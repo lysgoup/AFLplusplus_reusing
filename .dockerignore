@@ -73,21 +73,3 @@ test/unittests/unit_rand
 unicorn_mode/samples/*/\.test-*
 unicorn_mode/samples/*/output
 unicorn_mode/unicornafl
-
-# Submodules. Reusing_scanner builds from its own directory as context, so
-# nothing here ever needs it. Reusing-unibench_build's Dockerfiles do run
-# with this repo as their context (that is why their COPY paths carry the
-# Reusing-unibench_build/ prefix), but only for a handful of patches and
-# data files -- everything else is experiment output, gigabytes of it.
-Reusing_scanner/
-Reusing-unibench_build/
-!Reusing-unibench_build/aflplusplus/
-!Reusing-unibench_build/aflplusplus-cmplog/
-!Reusing-unibench_build/aflplusplus-reusing-target/
-!Reusing-unibench_build/aflplusplus-reusing_fuzzer_only/
-!Reusing-unibench_build/reusing-scanner-target/
-!Reusing-unibench_build/forkserver_libafl/
-!Reusing-unibench_build/forkserver_storfuzz/
-!Reusing-unibench_build/coverage/
-!Reusing-unibench_build/ffmpeg/
-!Reusing-unibench_build/tools/volume/seeds/
